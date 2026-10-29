@@ -1,0 +1,13 @@
+{
+  "name": "claude-code-voice",
+  "owner": {
+    "name": "bhargava-gumpula"
+  },
+  "plugins": [
+    {
+      "name": "voice",
+      "source": "./"
+    }
+  ],
+  "description": "Talk to Claude Code out loud: local or ElevenLabs voice, one /call away"
+}

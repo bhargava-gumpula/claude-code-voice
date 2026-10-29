@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""The voice of Claude Code, fully local: Parakeet ears, a small Ollama model as the talker, Kokoro mouth.
+
+Same protocol as agent.py (the ElevenLabs backend), so the mod treats both alike:
+stdout JSON lines {"port"}, {"mode","level"}, {"you"}, {"voice"}, {"ask":{"id","task"}}, {"note"}, {"error"};
+HTTP POST /result {"id","text"}  /progress {"text"}  /note {"text"}  /say {"text"} (text mode)  /quit.
+Env: VOICE_PROJECT, VOICE_TEXT=1, VOICE_LLM (Ollama model, default qwen3.5:4b), VOICE_SPEAKER (Kokoro id),
+     OLLAMA_HOST, VOICE_MODELS (folder, default ~/.cache/claude-voice/models), BARGE_LEVEL, VOICE_WAIT.
+"""
+import json, os, re, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import numpy as np
+
+PROJECT = os.environ.get("VOICE_PROJECT", os.getcwd())
+TEXT = os.environ.get("VOICE_TEXT") == "1"
+LLM = os.environ.get("VOICE_LLM", "qwen3.5:4b")
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+if not OLLAMA.startswith("http"):
+    OLLAMA = "http://" + OLLAMA
+MODELS = os.path.expanduser(os.environ.get("VOICE_MODELS", "~/.cache/claude-voice/models"))
+SPEAKER = int(os.environ.get("VOICE_SPEAKER", "3"))  # Kokoro v1.0: 3 af_heart, 2 af_bella, 16 am_michael, 26 bm_george
+WAIT = float(os.environ.get("VOICE_WAIT", "6"))
+# Interruptions: while the voice plays, mic audio above this level cuts it off (your voice is loud at the
+# mic, its own playback from the speakers is quiet). Calibration knob: raise it if it interrupts itself.
+BARGE_LEVEL = float(os.environ.get("BARGE_LEVEL", "0.3"))
+RATE = 16000
+ASR = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+TTS = "kokoro-multi-lang-v1_0"
+RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+
+PROMPT = """You are Claude Code, talking with your user out loud. This voice is you: the same Claude Code that \
+lives in their terminal, with full access to their computer, this project, its files, the terminal, git, the \
+browser and the internet. Anything Claude Code can do, you can do, because you are Claude Code. Never say you \
+are separate from Claude Code, never say you will ask or hand off to anything, never say you cannot see files \
+or run things.
+
+The `work` tool is your hands. When the user wants anything done, checked, read, explained, fixed, run, tested \
+or found in the project or on the computer, say a short lead-in like "Sure, let me look" and call `work` with \
+one complete instruction in plain words. Questions about what you are or what you can do, you answer yourself \
+("Yes, I can see your files, I'm right here in the project"), with no tool. When it returns the result, tell the user the gist in your own words. \
+If it says the work is still going, say so briefly; the outcome arrives later as a message starting with [done], \
+then tell the user what happened. Small talk, opinions and general questions you answer yourself, no tools.
+
+Messages starting with [done], [progress], [chat] or [context] are your own work and chat window reporting in, \
+never the user: use them, never read them back or thank anyone.
+
+Style: a sharp, warm colleague on a call. One to three short sentences. Plain spoken words: no lists, no \
+markdown, no symbols, no code, no file paths unless they matter. Never mention tools, hands or how you work. \
+If the user is quiet, stay quiet. Never invent a result. Confirm before anything destructive or outward-facing. \
+If something truly cannot be done, say so once and offer the nearest thing."""
+
+TOOLS = [
+    {"type": "function", "function": {"name": "work", "description": "Do something in the user's project or on their computer: read, explain, search, edit, create, run, test, git, browse. Returns the result or says the work is still going.",
+                                      "parameters": {"type": "object", "required": ["instruction"], "properties": {"instruction": {"type": "string", "description": "One complete instruction in plain words."}}}}},
+    {"type": "function", "function": {"name": "check_progress", "description": "What the current piece of work is doing right now, and its result if it just finished.",
+                                      "parameters": {"type": "object", "properties": {}}}},
+]
+
+LEAD_INS = ["Sure, let me look.", "On it.", "One sec, checking.", "Let me take a look."]
+state = {"level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "progress": "", "busy": threading.Lock()}
+pending = {"id": None, "task": None, "result": None, "told": True, "done": threading.Event()}
+history = []
+out_lock = threading.Lock()
+
+
+def emit(**obj):
+    with out_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+# ---- models -------------------------------------------------------------------------
+
+def fetch_models():
+    os.makedirs(MODELS, exist_ok=True)
+    need = [("silero_vad.onnx", f"{RELEASES}/asr-models/silero_vad.onnx", False),
+            (ASR, f"{RELEASES}/asr-models/{ASR}.tar.bz2", True),
+            (TTS, f"{RELEASES}/tts-models/{TTS}.tar.bz2", True)]
+    for name, url, tar in need:
+        if os.path.exists(os.path.join(MODELS, name)):
+            continue
+        emit(note=f"downloading {name} (first run)")
+        if tar:
+            subprocess.run(f"curl -sL '{url}' | tar xj", shell=True, cwd=MODELS, check=True)
+        else:
+            subprocess.run(["curl", "-sL", "-o", name, url], cwd=MODELS, check=True)
+
+
+def load_models():
+    import sherpa_onnx as s
+    vad_cfg = s.VadModelConfig()
+    vad_cfg.silero_vad.model = os.path.join(MODELS, "silero_vad.onnx")
+    vad_cfg.silero_vad.threshold = 0.5
+    vad_cfg.silero_vad.min_silence_duration = 0.6
+    vad_cfg.silero_vad.min_speech_duration = 0.25
+    vad_cfg.sample_rate = RATE
+    vad = s.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=60)
+    a = os.path.join(MODELS, ASR)
+    asr = s.OfflineRecognizer.from_transducer(encoder=f"{a}/encoder.int8.onnx", decoder=f"{a}/decoder.int8.onnx",
+                                              joiner=f"{a}/joiner.int8.onnx", tokens=f"{a}/tokens.txt",
+                                              model_type="nemo_transducer", num_threads=4)
+    k = os.path.join(MODELS, TTS)
+    tts = s.OfflineTts(s.OfflineTtsConfig(model=s.OfflineTtsModelConfig(
+        kokoro=s.OfflineTtsKokoroModelConfig(model=f"{k}/model.onnx", voices=f"{k}/voices.bin", tokens=f"{k}/tokens.txt",
+                                             data_dir=f"{k}/espeak-ng-data", lexicon=f"{k}/lexicon-us-en.txt", dict_dir=f"{k}/dict"),
+        num_threads=4, provider="cpu"), max_num_sentences=1))
+    return vad, asr, tts
+
+
+# ---- the hands -----------------------------------------------------------------------
+
+def work(args):
+    task = (args or {}).get("instruction", "").strip()
+    if not task:
+        return "No instruction given."
+    if pending["id"] and not pending["done"].is_set():
+        return "You are already in the middle of something; it reports in as [done] when finished. Say you'll do this right after."
+    pending.update(id=uuid.uuid4().hex, task=task, result=None, told=False)
+    pending["done"].clear()
+    state["progress"] = ""
+    emit(ask={"id": pending["id"], "task": task})
+    if pending["done"].wait(WAIT):
+        pending["told"] = True
+        return f"Done. Result:\n{pending['result']}"
+    return "Still going; it takes longer than a few seconds. Tell the user briefly. The outcome arrives as a [done] message."
+
+
+def check_progress(_args=None):
+    if not pending["id"]:
+        return "Nothing is being worked on right now."
+    if pending["done"].is_set():
+        pending["told"] = True
+        return f"Finished. Result:\n{pending['result']}"
+    return f"Still going. Right now: {state['progress'] or 'getting started'}."
+
+
+def finished(text):
+    pending["result"] = text
+    pending["done"].set()
+    if pending["told"]:
+        return
+    pending["told"] = True
+    deadline = time.time() + 20
+    while time.time() < min(state["play_until"] + 0.6, deadline):
+        time.sleep(0.1)
+    turn(f"[done] The work you started is finished. Outcome: {text[:3000]}\nTell the user what happened in your own words, briefly.")
+
+
+# ---- the talker (Ollama) ---------------------------------------------------------
+
+def ollama(messages, stream):
+    body = {"model": LLM, "messages": messages, "tools": TOOLS, "stream": stream, "think": False,
+            "keep_alive": "30m", "options": {"temperature": 0.4, "num_ctx": 8192}}
+    req = urllib.request.Request(f"{OLLAMA}/api/chat", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=120)
+
+
+def turn(user_text):
+    """One exchange: the user's words in, spoken sentences out, tool calls run in between."""
+    with state["busy"]:
+        history.append({"role": "user", "content": user_text})
+        gen = state["gen"]
+        for _ in range(4):  # tool rounds
+            text, calls = speak_stream(gen)
+            if gen != state["gen"]:
+                return  # interrupted
+            msg = {"role": "assistant", "content": text}
+            if calls:
+                msg["tool_calls"] = calls
+                if not text.strip():  # it went straight to work: say so, instead of a silent wait
+                    say(LEAD_INS[len(history) % len(LEAD_INS)], gen)
+            history.append(msg)
+            if not calls:
+                break
+            for c in calls:
+                fn = c["function"]
+                out = work(fn.get("arguments")) if fn["name"] == "work" else check_progress()
+                history.append({"role": "tool", "content": out, "tool_name": fn["name"]})
+        del history[:-40]
+
+
+def speak_stream(gen):
+    """Streams one assistant message from Ollama, speaking each sentence as it completes."""
+    text, calls, buf = "", [], ""
+    try:
+        with ollama(history_with_prompt(), True) as r:
+            for line in r:
+                if gen != state["gen"]:
+                    break
+                d = json.loads(line)
+                m = d.get("message", {})
+                piece = m.get("content", "")
+                if piece:
+                    text += piece
+                    buf += piece
+                    while True:
+                        cut = re.search(r"[.!?](\s|$)", buf)
+                        if not cut or len(buf[:cut.end()].strip()) < 2:
+                            break
+                        say(buf[:cut.end()].strip(), gen)
+                        buf = buf[cut.end():]
+                if m.get("tool_calls"):
+                    calls.extend(m["tool_calls"])
+                if d.get("done"):
+                    break
+    except (OSError, ValueError) as e:
+        emit(error=f"ollama: {e}")
+        say("Sorry, my local model isn't answering right now.", gen)
+    if buf.strip():
+        say(buf.strip(), gen)
+    return text, calls
+
+
+def history_with_prompt():
+    return [{"role": "system", "content": PROMPT + "\n\n" + project_context()}] + history
+
+
+# ---- the mouth --------------------------------------------------------------------------
+
+player = {"tts": None, "out": None}
+
+
+def spoken(text):
+    """Markdown and code marks read badly aloud: drop them."""
+    text = re.sub(r"[`*_#>]+", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def say(sentence, gen):
+    sentence = spoken(sentence)
+    if not sentence:
+        return
+    emit(voice=sentence)
+    if TEXT or gen != state["gen"]:
+        return
+    for _ in range(50):  # the speaker opens with the mic, a moment after start
+        if player["out"]:
+            break
+        time.sleep(0.1)
+    audio = player["tts"].generate(sentence, sid=SPEAKER, speed=1.05)
+    if gen != state["gen"]:
+        return
+    pcm = (np.clip(np.asarray(audio.samples), -1, 1) * 32767).astype(np.int16).tobytes()
+    state["play_until"] = max(time.time(), state["play_until"]) + len(pcm) / 2 / audio.sample_rate
+    for i in range(0, len(pcm), 4800):  # small writes so an interruption stops within ~100 ms
+        if gen != state["gen"]:
+            break
+        player["out"].write(pcm[i:i + 4800])
+
+
+def interrupt():
+    state["gen"] += 1
+    state["play_until"] = 0.0
+
+
+# ---- the ears --------------------------------------------------------------------------
+
+def listen(vad, asr):
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    mic = pa.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=512)
+    player["out"] = pa.open(format=pyaudio.paInt16, channels=1, rate=player["tts"].sample_rate, output=True)
+    last = 0.0
+    while state["live"]:
+        chunk = mic.read(512, exception_on_overflow=False)
+        x = np.frombuffer(chunk, np.int16).astype(np.float32) / 32768
+        level = float(np.sqrt(np.mean(x * x)) * 4) if len(x) else 0.0
+        state["level"] = min(1.0, level)
+        speaking = time.time() < state["play_until"] + 0.4
+        if speaking:
+            if level >= BARGE_LEVEL:
+                interrupt()  # you spoke over it
+            else:
+                x = np.zeros_like(x)  # ponytail: half-duplex gate, not echo cancellation
+        vad.accept_waveform(x)
+        now = time.time()
+        if now - last > 0.1:
+            emit(mode="speaking" if speaking else "listening", level=round(state["level"], 3))
+            last = now
+        while not vad.empty():
+            seg = vad.front
+            vad.pop()
+            st = asr.create_stream()
+            st.accept_waveform(RATE, seg.samples)
+            asr.decode_stream(st)
+            said = st.result.text.strip()
+            if said and re.search(r"\w", said):
+                emit(you=said)
+                interrupt()
+                threading.Thread(target=turn, args=(said,), daemon=True).start()
+    mic.close(); player["out"].close(); pa.terminate()
+
+
+# ---- control port -------------------------------------------------------------------
+
+def serve():
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            try:
+                if self.path == "/result" and body.get("id") == pending["id"]:
+                    threading.Thread(target=finished, args=(body.get("text", ""),), daemon=True).start()
+                elif self.path == "/progress":
+                    state["progress"] = body.get("text", "")
+                elif self.path == "/note":
+                    history.append({"role": "system", "content": body.get("text", "")})
+                elif self.path == "/say" and TEXT:
+                    emit(you=body.get("text", ""))
+                    interrupt()
+                    threading.Thread(target=turn, args=(body.get("text", ""),), daemon=True).start()
+                elif self.path == "/quit":
+                    state["live"] = False
+                    os.kill(os.getpid(), signal.SIGTERM)
+            except Exception as e:  # noqa: BLE001
+                emit(error=f"{self.path}: {e}")
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(b"{}")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    emit(port=srv.server_address[1])
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def project_context():
+    name = os.path.basename(PROJECT.rstrip("/")) or PROJECT
+    try:
+        branch = subprocess.run(["git", "-C", PROJECT, "branch", "--show-current"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        branch = ""
+    return f"[context] You are working in the project \"{name}\"" + (f" on branch {branch}" if branch else "") + f" (folder {PROJECT})."
+
+
+def main():
+    srv = serve()
+    try:
+        try:
+            urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=3).read()
+        except OSError:
+            emit(error=f"Ollama is not running at {OLLAMA} (install from ollama.com, then `ollama pull {LLM}`)"); return 2
+        fetch_models()
+        emit(note="loading speech models")
+        vad, asr, tts = load_models()
+        player["tts"] = tts
+        signal.signal(signal.SIGTERM, lambda *_: state.update(live=False))
+        threading.Thread(target=lambda: ollama([{"role": "user", "content": "hi"}], False).read(), daemon=True).start()  # warm the model
+        emit(note="")
+        greeting = "Hey. What are we working on?"
+        history.append({"role": "assistant", "content": greeting})
+        if TEXT:
+            emit(voice=greeting)
+            while state["live"]:
+                time.sleep(0.2)
+        else:
+            import pyaudio  # noqa: F401  (fail early if missing)
+            threading.Thread(target=lambda: (time.sleep(0.3), say(greeting, state["gen"])), daemon=True).start()
+            listen(vad, asr)
+    except Exception as e:  # noqa: BLE001
+        emit(error=str(e)); return 1
+    finally:
+        state["live"] = False
+        srv.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

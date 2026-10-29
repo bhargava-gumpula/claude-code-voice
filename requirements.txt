@@ -1,0 +1,4 @@
+sherpa-onnx>=2.0
+pyaudio
+numpy
+elevenlabs>=2.70

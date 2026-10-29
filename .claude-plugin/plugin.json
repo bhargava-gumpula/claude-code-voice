@@ -1,0 +1,8 @@
+{
+  "name": "voice",
+  "version": "1.0.0",
+  "description": "Talk to Claude Code out loud: /call starts a live voice conversation, fully local (Parakeet, Qwen, Kokoro) or on ElevenLabs, with an orb above the prompt",
+  "author": { "name": "Bhargava Gumpula" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
