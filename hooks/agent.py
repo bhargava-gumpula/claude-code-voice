@@ -21,6 +21,9 @@ import array, json, math, os, signal, subprocess, sys, threading, time, urllib.e
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from elevenlabs.client import ElevenLabs
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I leaves the script's folder off the path
+from jobs import Jobs  # noqa: E402
 from elevenlabs.conversational_ai.conversation import AudioInterface, ClientTools, Conversation, ConversationInitiationData
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
 
@@ -49,8 +52,11 @@ explained, fixed, run, tested, searched or found, say a short natural lead-in ("
 and call `work` with one complete instruction in plain words, including anything from the conversation it \
 needs. If it returns the result, tell the user the gist right away in your own words. If it says the work is \
 still going, say so in a few words and keep the conversation going; the outcome arrives later as a message that \
-starts with [done], and then you tell the user what happened. Call `check_progress` only when they ask how \
-it is going. You can give opinions, discuss design, brainstorm and answer general questions yourself without \
+starts with [done], and then you tell the user what happened. The user can ask for several things in a row: \
+call `work` once for each new request, right away, even while earlier ones are running; they are done in the \
+order asked and each outcome comes back as its own [done] message that names the task. Say which task an \
+outcome is about ("The tests are done...", "And the README..."), and never mix up or repeat one already told. \
+Call `check_progress` only when they ask how things are going. You can give opinions, discuss design, brainstorm and answer general questions yourself without \
 tools; use `work` for anything that touches the real project or computer.
 
 Messages that start with [done], [progress], [chat] or [context] are your own work and your own chat window \
@@ -82,8 +88,7 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {}}},
 ]
 
-state = {"level": 0.0, "play_until": 0.0, "live": True, "conv": None, "progress": ""}
-pending = {"id": None, "task": None, "result": None, "told": True, "done": threading.Event()}
+state = {"level": 0.0, "play_until": 0.0, "live": True, "conv": None, "heard_at": 0.0}
 out_lock = threading.Lock()
 
 
@@ -133,47 +138,26 @@ def ensure_agent():
 # ---- Claude Code as the hands ------------------------------------------------------
 
 def work(params):
-    task = (params or {}).get("instruction", "").strip()
-    if not task:
-        return "No instruction given."
-    if pending["id"] and not pending["done"].is_set():
-        return ("You are already in the middle of something; it will report in as [done] when finished. "
-                "Tell the user you'll get to this right after, and call work again once it reports.")
-    pending.update(id=uuid.uuid4().hex, task=task, result=None, told=False)
-    pending["done"].clear()
-    state["progress"] = ""
-    emit(ask={"id": pending["id"], "task": task})
-    if pending["done"].wait(WAIT):
-        pending["told"] = True
-        return f"Done. Result:\n{pending['result']}"
-    return ("Still going; it takes a bit longer than a few seconds. Tell the user briefly and keep talking. "
-            "The outcome will arrive as a [done] message.")
+    return jobs.work((params or {}).get("instruction", ""))
 
 
 def check_progress(_params=None):
-    if not pending["id"]:
-        return "Nothing is being worked on right now."
-    if pending["done"].is_set():
-        pending["told"] = True
-        return f"Finished. Result:\n{pending['result']}"
-    return f"Still going. Right now: {state['progress'] or 'getting started'}."
+    return jobs.check()
 
 
-def finished(text):
-    """A result that came in after `work` had already returned: push it into the conversation."""
-    pending["result"] = text
-    pending["done"].set()
-    if pending["told"]:
-        return
-    pending["told"] = True
+def announce(text):
     conv = state["conv"]
     if conv:
-        # let it finish its sentence first: a user message cuts the agent off
-        deadline = time.time() + 20
-        while time.time() < min(state["play_until"] + 0.6, deadline):
-            time.sleep(0.1)
-        conv.send_user_message(f"[done] The work you started is finished. Outcome: {text[:3000]}\n"
-                               f"Tell the user what happened in your own words, briefly.")
+        conv.send_user_message(text)
+
+
+def idle():
+    """Nobody speaking: the voice's audio has played out and the user has not talked for a moment."""
+    now = time.time()
+    return now > state["play_until"] + 0.6 and now - state["heard_at"] > 1.0
+
+
+jobs = Jobs(emit, announce, idle, WAIT)
 
 
 # ---- audio ----------------------------------------------------------------------------
@@ -184,6 +168,8 @@ class Audio(DefaultAudioInterface):
             samples = array.array("h", chunk)
             if samples:
                 state["level"] = min(1.0, math.sqrt(sum(s * s for s in samples) / len(samples)) / 8000)
+                if state["level"] > 0.15 and time.time() > state["play_until"] + 0.4:
+                    state["heard_at"] = time.time()
             if time.time() < state["play_until"] + 0.4 and state["level"] < BARGE_LEVEL:
                 chunk = bytes(len(chunk))  # ponytail: half-duplex gate, not echo cancellation
             input_callback(chunk)
@@ -238,16 +224,17 @@ def serve():
             body = json.loads(self.rfile.read(n) or b"{}")
             conv = state["conv"]
             try:
-                if self.path == "/result" and body.get("id") == pending["id"]:
-                    finished(body.get("text", ""))
+                if self.path == "/result":
+                    jobs.finished(body.get("id"), body.get("text", ""))
                 elif self.path == "/progress":
-                    state["progress"] = body.get("text", "")
+                    jobs.progress(body.get("text", ""), body.get("id"))
                     if conv:
-                        conv.send_contextual_update(f"[progress] {state['progress']}")
+                        conv.send_contextual_update(f"[progress] {body.get('text', '')}")
                 elif self.path == "/note" and conv:
                     conv.send_contextual_update(body.get("text", ""))
                 elif self.path == "/say" and conv and TEXT:
                     emit(you=body.get("text", ""))
+                    state["heard_at"] = time.time()
                     conv.send_user_message(body.get("text", ""))
                 elif self.path == "/quit":
                     state["live"] = False
@@ -286,7 +273,7 @@ def main():
             ElevenLabs(api_key=KEY), AGENT, requires_auth=True,
             audio_interface=Silent() if TEXT else Audio(), client_tools=tools,
             config=ConversationInitiationData(conversation_config_override={"agent": {"first_message": "Sorry, I dropped for a second. I'm back."}}) if os.environ.get("VOICE_RESUME") else None,
-            callback_user_transcript=lambda t: emit(you=t),
+            callback_user_transcript=lambda t: (state.update(heard_at=time.time()), emit(you=t)),
             callback_agent_response=lambda r: emit(voice=r),
         )
         state["conv"] = conv
