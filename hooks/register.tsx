@@ -37,17 +37,21 @@ const post = async ($: EngineInterface, path: string, body: object = {}) => {
   }
 }
 
-// The mod's own Python environment, made on first use from requirements.txt (uv when present).
+// The mod's Python environment, made on first use from requirements.txt (uv when present). It lives
+// outside the mod folder: Claude Code watches that folder and reloads the mod on any write there,
+// which would kill a running call.
 const python = async ($: EngineInterface) => {
-  const root = $.plugin.root
-  const py = `${root}/.venv/bin/python`
+  const home = (await $.env.get('HOME')) ?? '/tmp'
+  const venv = `${home}/.cache/claude-voice/venv`
+  const py = `${venv}/bin/python`
   const ok = await $.process.run([py, '-c', 'import sherpa_onnx, pyaudio, numpy, elevenlabs']).catch(() => undefined)
   if (ok?.exitCode === 0) return py
   await patch($, { note: 'setting up Python packages (first run, about a minute)…' })
+  const req = `${$.plugin.root}/requirements.txt`
   const uv = await $.process.run(['uv', '--version']).catch(() => undefined)
   const made = uv?.exitCode === 0
-    ? await $.process.run(['sh', '-c', `cd "${root}" && uv venv -q .venv && uv pip install -q -p .venv/bin/python -r requirements.txt`], { timeoutMs: 600_000 })
-    : await $.process.run(['sh', '-c', `cd "${root}" && python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt`], { timeoutMs: 600_000 })
+    ? await $.process.run(['sh', '-c', `mkdir -p "${home}/.cache/claude-voice" && uv venv -q "${venv}" && uv pip install -q -p "${py}" -r "${req}"`], { timeoutMs: 600_000 })
+    : await $.process.run(['sh', '-c', `mkdir -p "${home}/.cache/claude-voice" && python3 -m venv "${venv}" && "${venv}/bin/pip" install -q -r "${req}"`], { timeoutMs: 600_000 })
   if (made.exitCode !== 0) throw new Error(`Python setup failed: ${made.stderr.slice(-400)}`)
   return py
 }
@@ -99,9 +103,21 @@ const start = async ($: EngineInterface, asked = '') => {
     const ear = $.process.spawn({ argv: [py, '-I', `${$.plugin.root}/hooks/${backend === 'local' ? 'local.py' : 'agent.py'}`], env })
     let buf = ''
     let lastDraw = 0
+    let errTail = ''
+    let exit: { code: number | null; signal: string | null } | undefined
+    const it = ear[Symbol.asyncIterator]()
     try {
-      for await (const { stream, text } of ear) {
-        if (stream !== 'stdout') continue
+      while (true) {
+        const step = await it.next()
+        if (step.done) {
+          exit = step.value
+          break
+        }
+        const { stream, text } = step.value
+        if (stream === 'stderr') {
+          errTail = (errTail + text).slice(-600)
+          continue
+        }
         buf += text
         const lines = buf.split('\n')
         buf = lines.pop() ?? ''
@@ -142,10 +158,15 @@ const start = async ($: EngineInterface, asked = '') => {
           }
         }
       }
+    } catch (e) {
+      errTail += ` | mod: ${e instanceof Error ? e.message : String(e)}`
     } finally {
       port = 0
       await update($, call, () => OFF)
-      if (!ending) $.ui.toast('voice: the call ended')
+      const why = exit ? `exit ${exit.code ?? exit.signal}` : 'stream ended'
+      const home = (await $.env.get('HOME')) ?? '/tmp'
+      void $.fs.write(`${home}/.cache/claude-voice/last-call.log`, `${new Date().toISOString()} ${backend} ${why}\n${errTail.replace(/.*resampler.*\n?|.*sample_rate.*\n?/g, '')}\n`).catch(() => undefined)
+      if (!ending) $.ui.toast(`voice: the call ended (${why})`)
     }
   })()
 }
@@ -153,6 +174,8 @@ const start = async ($: EngineInterface, asked = '') => {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
+    // A reload (an edit to the mod) ends any call with it: the state must not say one is still on.
+    await update($, call, () => OFF)
     await $.command.register({ name: 'call', description: 'Start or end a spoken call with this chat (/call local for the offline voice, /call eleven for ElevenLabs)', argumentHint: '[local|eleven]' })
     return next(e)
   })

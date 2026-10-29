@@ -39,7 +39,7 @@ brew install ollama portaudio uv && ollama pull qwen3.5:4b
 ```
 
 (Linux: install Ollama from ollama.com and `portaudio19-dev` from your package manager; `uv` is optional.)
-The first `/call` builds a small Python environment and downloads the speech models (about a minute).
+The first `/call` builds a small Python environment in `~/.cache/claude-voice` and downloads the speech models (about a minute).
 
 For ElevenLabs instead, put `ELEVENLABS_API_KEY` in the environment Claude Code runs under (the `env` block of
 `~/.claude/settings.json` works for both the desktop app and the terminal). The first call creates an agent
@@ -66,6 +66,18 @@ The band above the prompt is empty when no call is on, so the mod takes no space
 | `BARGE_LEVEL` | `0.3` | how loud you must be to interrupt; `1.01` never |
 | `VOICE_WAIT` | `6` / `9` | seconds a task may take before the voice says "still on it" and carries on |
 | `VOICE_MODELS` | `~/.cache/claude-voice/models` | where the local models live |
+
+## Troubleshooting
+
+- **The call ends right away.** The toast says why, and `~/.cache/claude-voice/last-call.log` holds the voice
+  program's last output. Common causes: Ollama not running (`ollama serve`), the model not pulled
+  (`ollama pull qwen3.5:4b`), or no microphone permission.
+- **It hears nothing.** macOS asks for microphone access the first time; if you declined, allow Claude (or your
+  terminal app) under System Settings, Privacy & Security, Microphone, then call again.
+- **It cuts itself off on speakers.** Raise `BARGE_LEVEL` (0.5), or use headphones and lower it (0.2) for
+  snappier interruptions.
+- **Editing the mod drops the call.** Claude Code reloads a mod when its files change; start the call again.
+- **Try it without a microphone:** `VOICE_BACKEND=local python3 test/live.py <project> "hey" "run the tests"`.
 
 ## How it works
 

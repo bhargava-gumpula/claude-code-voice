@@ -173,10 +173,18 @@ def turn(user_text):
             history.append(msg)
             if not calls:
                 break
+            waiting = False
             for c in calls:
                 fn = c["function"]
                 out = work(fn.get("arguments")) if fn["name"] == "work" else check_progress()
                 history.append({"role": "tool", "content": out, "tool_name": fn["name"]})
+                waiting = waiting or out.startswith(("Still going", "You are already"))
+            if waiting:
+                # a small model fills a wait with chatter: say one line and go quiet until [done]
+                line = "Still on it, I'll tell you when it's done."
+                history.append({"role": "assistant", "content": line})
+                say(line, gen)
+                break
         del history[:-40]
 
 

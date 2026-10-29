@@ -14,7 +14,7 @@ import json, os, subprocess, sys, threading, time, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.environ.get("VOICE_BACKEND", "elevenlabs")
 AGENT = os.path.join(HERE, "..", "hooks", "local.py" if BACKEND == "local" else "agent.py")
-PY = os.path.join(HERE, "..", ".venv", "bin", "python")
+PY = os.path.expanduser("~/.cache/claude-voice/venv/bin/python")
 project, lines = sys.argv[1], sys.argv[2:]
 
 env = dict(os.environ, VOICE_TEXT="1", VOICE_PROJECT=project)
