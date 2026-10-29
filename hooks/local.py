@@ -5,7 +5,7 @@ Same protocol as agent.py (the ElevenLabs backend), so the mod treats both alike
 stdout JSON lines {"port"}, {"mode","level"}, {"you"}, {"voice"}, {"ask":{"id","task"}}, {"note"}, {"error"};
 HTTP POST /result {"id","text"}  /progress {"text"}  /note {"text"}  /say {"text"} (text mode)  /quit.
 Env: VOICE_PROJECT, VOICE_TEXT=1, VOICE_LLM (Ollama model, default qwen3.5:4b), VOICE_SPEAKER (Kokoro id),
-     OLLAMA_HOST, VOICE_MODELS (folder, default ~/.cache/claude-voice/models), BARGE_LEVEL, VOICE_WAIT.
+     OLLAMA_HOST, VOICE_MODELS (folder, default ~/.cache/claude-voice/models), BARGE_LEVEL, VOICE_WAIT, VOICE_RESUME.
 """
 import json, os, re, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -263,9 +263,13 @@ def say(sentence, gen):
     pcm = (np.clip(np.asarray(audio.samples), -1, 1) * 32767).astype(np.int16).tobytes()
     state["play_until"] = max(time.time(), state["play_until"]) + len(pcm) / 2 / audio.sample_rate
     for i in range(0, len(pcm), 4800):  # small writes so an interruption stops within ~100 ms
-        if gen != state["gen"]:
+        out = player["out"]
+        if gen != state["gen"] or not out:
             break
-        player["out"].write(pcm[i:i + 4800])
+        try:
+            out.write(pcm[i:i + 4800])
+        except OSError:
+            break  # speaker went away mid-sentence; listen() reopens it
 
 
 def interrupt():
@@ -292,10 +296,23 @@ def hear(asr, samples):
 
 
 def listen(vad, asr):
+    """Runs until you hang up. Any audio error (headphones unplugged, device switch) reopens the devices."""
     import pyaudio
-    pa = pyaudio.PyAudio()
-    mic = pa.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=512)
-    player["out"] = pa.open(format=pyaudio.paInt16, channels=1, rate=player["tts"].sample_rate, output=True)
+    while state["live"]:
+        pa = pyaudio.PyAudio()
+        try:
+            mic = pa.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=512)
+            player["out"] = pa.open(format=pyaudio.paInt16, channels=1, rate=player["tts"].sample_rate, output=True)
+            hear_loop(vad, asr, mic)
+        except Exception as e:  # noqa: BLE001
+            print(f"audio error, reopening: {e}", file=sys.stderr, flush=True)
+            time.sleep(1)
+        finally:
+            player["out"] = None
+            pa.terminate()  # closes mic and speaker too
+
+
+def hear_loop(vad, asr, mic):
     last = 0.0
     while state["live"]:
         chunk = mic.read(512, exception_on_overflow=False)
@@ -321,7 +338,6 @@ def listen(vad, asr):
                 emit(you=said)
                 interrupt()
                 threading.Thread(target=turn, args=(said,), daemon=True).start()
-    mic.close(); player["out"].close(); pa.terminate()
 
 
 # ---- control port -------------------------------------------------------------------
@@ -387,7 +403,8 @@ def main():
         except OSError as e:
             emit(error=f"ollama: {e} (is `{LLM}` pulled? `ollama pull {LLM}`)"); return 2
         emit(note="")
-        greeting = "Hey. What are we working on?"
+        # VOICE_RESUME: the mod restarted a call that dropped, so pick up instead of greeting again
+        greeting = "Sorry, I dropped for a second. I'm back." if os.environ.get("VOICE_RESUME") else "Hey. What are we working on?"
         history.append({"role": "assistant", "content": greeting})
         if TEXT:
             emit(voice=greeting)
