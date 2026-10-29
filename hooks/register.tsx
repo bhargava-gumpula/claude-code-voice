@@ -15,6 +15,7 @@ const SPOKEN =
 // ponytail: one call per session; a second /voice hangs up
 let port = 0
 let ending = false
+let quickFails = 0 // restarts that died again within 20s; three in a row and we stop
 let pendingId = '' // the agent's ask that Claude is working on
 let cwd = ''
 let lastProgress = 0
@@ -77,7 +78,7 @@ const pickBackend = async ($: EngineInterface, asked: string): Promise<Backend> 
   return (await $.env.get('ELEVENLABS_API_KEY')) ? 'elevenlabs' : 'local'
 }
 
-const start = async ($: EngineInterface, asked = '') => {
+const start = async ($: EngineInterface, asked = '', resume = false) => {
   const backend = await pickBackend($, asked)
   const key = await $.env.get('ELEVENLABS_API_KEY')
   if (backend === 'elevenlabs' && !key) {
@@ -85,8 +86,11 @@ const start = async ($: EngineInterface, asked = '') => {
     return
   }
   await $.store.set('backend', backend)
-  await update($, call, () => ({ ...OFF, mode: 'starting' as Mode, backend }))
-  ending = false
+  await update($, call, () => ({ ...OFF, mode: 'starting' as Mode, backend, note: resume ? 'reconnecting' : '' }))
+  if (!resume) {
+    ending = false
+    quickFails = 0
+  }
   let py: string
   try {
     py = await python($)
@@ -101,6 +105,9 @@ const start = async ($: EngineInterface, asked = '') => {
   const agent = (await $.env.get('ELEVENLABS_AGENT_ID')) ?? (await $.store.get('agentId'))
   if (typeof agent === 'string' && agent) env.ELEVENLABS_AGENT_ID = agent
   if (cwd) env.VOICE_PROJECT = cwd
+  if (resume) env.VOICE_RESUME = '1'
+  if (ending) return // hung up while Python was being set up
+  const startedAt = Date.now()
 
   void (async () => {
     const ear = $.process.spawn({ argv: [py, '-I', `${$.plugin.root}/hooks/${backend === 'local' ? 'local.py' : 'agent.py'}`], env })
@@ -165,11 +172,19 @@ const start = async ($: EngineInterface, asked = '') => {
       errTail += ` | mod: ${e instanceof Error ? e.message : String(e)}`
     } finally {
       port = 0
-      await update($, call, () => OFF)
       const why = exit ? `exit ${exit.code ?? exit.signal}` : 'stream ended'
       const home = (await $.env.get('HOME')) ?? '/tmp'
       void $.fs.write(`${home}/.cache/claude-voice/last-call.log`, `${new Date().toISOString()} ${backend} ${why}\n${errTail.replace(/.*resampler.*\n?|.*sample_rate.*\n?/g, '')}\n`).catch(() => undefined)
-      if (!ending) $.ui.toast(`voice: the call ended (${why})`)
+      // Only you end a call: anything else (a crash, a dropped connection, the 2-hour cap) reconnects.
+      // Exit 2 is a setup problem (no Ollama, no key) that a retry cannot fix.
+      quickFails = Date.now() - startedAt < 20_000 ? quickFails + 1 : 0
+      if (ending || exit?.code === 2 || quickFails >= 3) {
+        await update($, call, () => OFF)
+        if (!ending) $.ui.toast(`voice: the call ended (${why}); details in ~/.cache/claude-voice/last-call.log`)
+      } else {
+        await patch($, { mode: 'starting', note: 'reconnecting' })
+        void $.clock.after(1500, () => void (ending ? update($, call, () => OFF) : start($, backend, true)))
+      }
     }
   })()
 }
