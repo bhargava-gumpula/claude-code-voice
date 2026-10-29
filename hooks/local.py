@@ -58,7 +58,7 @@ TOOLS = [
 ]
 
 LEAD_INS = ["Sure, let me look.", "On it.", "One sec, checking.", "Let me take a look."]
-state = {"level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "progress": "", "busy": threading.Lock()}
+state = {"acked": False, "level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "progress": "", "busy": threading.Lock()}
 pending = {"id": None, "task": None, "result": None, "told": True, "done": threading.Event()}
 history = []
 out_lock = threading.Lock()
@@ -161,6 +161,7 @@ def turn(user_text):
     with state["busy"]:
         history.append({"role": "user", "content": user_text})
         gen = state["gen"]
+        state["acked"] = False
         for _ in range(4):  # tool rounds
             text, calls = speak_stream(gen)
             if gen != state["gen"]:
@@ -168,7 +169,7 @@ def turn(user_text):
             msg = {"role": "assistant", "content": text}
             if calls:
                 msg["tool_calls"] = calls
-                if not text.strip():  # it went straight to work: say so, instead of a silent wait
+                if not text.strip() and not state["acked"]:  # straight to work: say so, instead of a silent wait
                     say(LEAD_INS[len(history) % len(LEAD_INS)], gen)
             history.append(msg)
             if not calls:
@@ -194,7 +195,7 @@ def speak_stream(gen):
     first = threading.Event()
 
     def filler():  # a cold or busy model can take seconds: never leave dead air on a call
-        if not first.wait(2.5) and gen == state["gen"]:
+        if not first.wait(2.5) and gen == state["gen"] and not state["acked"]:
             say("One sec.", gen)
     threading.Thread(target=filler, daemon=True).start()
     try:
@@ -248,6 +249,7 @@ def say(sentence, gen):
     sentence = spoken(sentence)
     if not sentence:
         return
+    state["acked"] = True
     emit(voice=sentence)
     if TEXT or gen != state["gen"]:
         return
