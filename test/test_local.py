@@ -11,4 +11,13 @@ assert local.spoken("   ") == ""
 assert local.work({"instruction": ""}) == "No instruction given."
 assert local.check_progress() == "Nothing is being worked on right now."
 assert "[context]" in local.project_context()
+
+
+class Boom:  # a recognizer that fails like Parakeet does on an empty clip
+    def create_stream(self):
+        raise RuntimeError("Invalid input shape: {0,128}")
+
+
+assert local.hear(Boom(), []) == ""  # too short: skipped
+assert local.hear(Boom(), [0.1] * 16000) == ""  # recognizer error: skipped, call stays up
 print("ok")
