@@ -275,6 +275,22 @@ def interrupt():
 
 # ---- the ears --------------------------------------------------------------------------
 
+def hear(asr, samples):
+    """Speech to text for one VAD clip. Never raises: a bad clip must not end the call."""
+    samples = np.asarray(samples, np.float32)
+    if len(samples) < RATE // 4:  # blips under 0.25s are clicks, not words
+        return ""
+    samples = np.concatenate([samples, np.zeros(RATE // 2, np.float32)])  # tail room for the encoder
+    try:
+        st = asr.create_stream()
+        st.accept_waveform(RATE, samples)
+        asr.decode_stream(st)
+        return st.result.text.strip()
+    except Exception as e:
+        print(f"asr skipped a clip: {e}", file=sys.stderr, flush=True)
+        return ""
+
+
 def listen(vad, asr):
     import pyaudio
     pa = pyaudio.PyAudio()
@@ -300,10 +316,7 @@ def listen(vad, asr):
         while not vad.empty():
             seg = vad.front
             vad.pop()
-            st = asr.create_stream()
-            st.accept_waveform(RATE, seg.samples)
-            asr.decode_stream(st)
-            said = st.result.text.strip()
+            said = hear(asr, seg.samples)
             if said and re.search(r"\w", said):
                 emit(you=said)
                 interrupt()
