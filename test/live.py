@@ -36,7 +36,15 @@ def post(path, body):
     urllib.request.urlopen(req, timeout=10).read()
 
 
+claude_lock = threading.Lock()  # Claude Code runs queued prompts one at a time, in order
+
+
 def do(ask):
+    with claude_lock:
+        run(ask)
+
+
+def run(ask):
     print(f"  [{time.time() - t0:5.1f}s] ask -> claude -p: {ask['task']}", flush=True)
     post("/progress", {"text": "reading the project"})
     ran = subprocess.run(["claude", "-p", ask["task"], "--permission-mode", "acceptEdits", "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git branch:*),Bash(ls:*),Bash(wc:*),Bash(find:*)"], cwd=project,
