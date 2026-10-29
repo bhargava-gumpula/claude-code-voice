@@ -69,6 +69,8 @@ The band above the prompt is empty when no call is on, so the mod takes no space
 
 ## Troubleshooting
 
+- **The call stays on until you end it**, however long you are quiet. If the voice program drops, it
+  reconnects by itself ("Sorry, I dropped for a second"). It only gives up after three quick failures in a row.
 - **The call ends right away.** The toast says why, and `~/.cache/claude-voice/last-call.log` holds the voice
   program's last output. Common causes: Ollama not running (`ollama serve`), the model not pulled
   (`ollama pull qwen3.5:4b`), or no microphone permission.
