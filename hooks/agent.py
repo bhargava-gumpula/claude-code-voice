@@ -21,7 +21,7 @@ import array, json, math, os, signal, subprocess, sys, threading, time, urllib.e
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from elevenlabs.client import ElevenLabs
-from elevenlabs.conversational_ai.conversation import AudioInterface, ClientTools, Conversation
+from elevenlabs.conversational_ai.conversation import AudioInterface, ClientTools, Conversation, ConversationInitiationData
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
 
 KEY = os.environ.get("ELEVENLABS_API_KEY", "")
@@ -109,20 +109,24 @@ def agent_config():
                   "prompt": {"prompt": PROMPT, "llm": LLM, "temperature": 0.3, "tools": TOOLS}},
         "tts": {"model_id": "eleven_turbo_v2", "voice_id": VOICE, "stability": 0.45, "similarity_boost": 0.85,
                 "speed": 1.0, "optimize_streaming_latency": 3},
-        "turn": {"mode": "turn", "turn_timeout": 45.0, "turn_eagerness": "normal"},
+        "turn": {"mode": "turn", "turn_timeout": -1, "turn_eagerness": "normal", "silence_end_call_timeout": -1},
         "conversation": {"max_duration_seconds": 7200,
                          "client_events": ["audio", "interruption", "agent_response", "user_transcript",
                                            "agent_response_correction", "agent_tool_response"]},
     }
 
 
+# lets a restarted call (VOICE_RESUME) open with a pick-up line instead of the greeting
+PLATFORM = {"overrides": {"conversation_config_override": {"agent": {"first_message": True}}}}
+
+
 def ensure_agent():
     """Creates the agent, or brings the existing one up to date with this file's prompt, voice and model."""
     global AGENT
     if AGENT:
-        api("PATCH", f"/convai/agents/{AGENT}", {"conversation_config": agent_config()})
+        api("PATCH", f"/convai/agents/{AGENT}", {"conversation_config": agent_config(), "platform_settings": PLATFORM})
         return
-    AGENT = api("POST", "/convai/agents/create", {"name": "Claude Code voice", "conversation_config": agent_config()})["agent_id"]
+    AGENT = api("POST", "/convai/agents/create", {"name": "Claude Code voice", "conversation_config": agent_config(), "platform_settings": PLATFORM})["agent_id"]
     emit(agent_id=AGENT)
 
 
@@ -281,6 +285,7 @@ def main():
         conv = Conversation(
             ElevenLabs(api_key=KEY), AGENT, requires_auth=True,
             audio_interface=Silent() if TEXT else Audio(), client_tools=tools,
+            config=ConversationInitiationData(conversation_config_override={"agent": {"first_message": "Sorry, I dropped for a second. I'm back."}}) if os.environ.get("VOICE_RESUME") else None,
             callback_user_transcript=lambda t: emit(you=t),
             callback_agent_response=lambda r: emit(voice=r),
         )
