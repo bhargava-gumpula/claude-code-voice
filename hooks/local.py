@@ -12,6 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I leaves the script's folder off the path
+from jobs import Jobs  # noqa: E402
+
 PROJECT = os.environ.get("VOICE_PROJECT", os.getcwd())
 TEXT = os.environ.get("VOICE_TEXT") == "1"
 LLM = os.environ.get("VOICE_LLM", "qwen3.5:4b")
@@ -37,7 +40,9 @@ or run things.
 
 The `work` tool is your hands. When the user wants anything done, checked, read, explained, fixed, run, tested \
 or found in the project or on the computer, say a short lead-in like "Sure, let me look" and call `work` with \
-one complete instruction in plain words. Questions about what you are or what you can do, you answer yourself \
+one complete instruction in plain words. The user can ask for several things in a row: call `work` once for \
+each new request right away, even while earlier ones run; they are done in order and each outcome comes back as \
+its own [done] message naming the task. Say which task an outcome is about, and never repeat one already told. Questions about what you are or what you can do, you answer yourself \
 ("Yes, I can see your files, I'm right here in the project"), with no tool. When it returns the result, tell the user the gist in your own words. \
 If it says the work is still going, say so briefly; the outcome arrives later as a message starting with [done], \
 then tell the user what happened. Small talk, opinions and general questions you answer yourself, no tools.
@@ -58,8 +63,7 @@ TOOLS = [
 ]
 
 LEAD_INS = ["Sure, let me look.", "On it.", "One sec, checking.", "Let me take a look."]
-state = {"acked": False, "level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "progress": "", "busy": threading.Lock()}
-pending = {"id": None, "task": None, "result": None, "told": True, "done": threading.Event()}
+state = {"acked": False, "level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "heard_at": 0.0, "busy": threading.Lock()}
 history = []
 out_lock = threading.Lock()
 
@@ -111,40 +115,20 @@ def load_models():
 # ---- the hands -----------------------------------------------------------------------
 
 def work(args):
-    task = (args or {}).get("instruction", "").strip()
-    if not task:
-        return "No instruction given."
-    if pending["id"] and not pending["done"].is_set():
-        return "You are already in the middle of something; it reports in as [done] when finished. Say you'll do this right after."
-    pending.update(id=uuid.uuid4().hex, task=task, result=None, told=False)
-    pending["done"].clear()
-    state["progress"] = ""
-    emit(ask={"id": pending["id"], "task": task})
-    if pending["done"].wait(WAIT):
-        pending["told"] = True
-        return f"Done. Result:\n{pending['result']}"
-    return "Still going; it takes longer than a few seconds. Tell the user briefly. The outcome arrives as a [done] message."
+    return jobs.work((args or {}).get("instruction", ""))
 
 
 def check_progress(_args=None):
-    if not pending["id"]:
-        return "Nothing is being worked on right now."
-    if pending["done"].is_set():
-        pending["told"] = True
-        return f"Finished. Result:\n{pending['result']}"
-    return f"Still going. Right now: {state['progress'] or 'getting started'}."
+    return jobs.check()
 
 
-def finished(text):
-    pending["result"] = text
-    pending["done"].set()
-    if pending["told"]:
-        return
-    pending["told"] = True
-    deadline = time.time() + 20
-    while time.time() < min(state["play_until"] + 0.6, deadline):
-        time.sleep(0.1)
-    turn(f"[done] The work you started is finished. Outcome: {text[:3000]}\nTell the user what happened in your own words, briefly.")
+def idle():
+    """Nobody speaking and no exchange under way: a result can be told now."""
+    now = time.time()
+    return now > state["play_until"] + 0.6 and now - state["heard_at"] > 1.0 and not state["busy"].locked()
+
+
+jobs = Jobs(emit, lambda text: turn(text), idle, WAIT)
 
 
 # ---- the talker (Ollama) ---------------------------------------------------------
@@ -179,10 +163,11 @@ def turn(user_text):
                 fn = c["function"]
                 out = work(fn.get("arguments")) if fn["name"] == "work" else check_progress()
                 history.append({"role": "tool", "content": out, "tool_name": fn["name"]})
-                waiting = waiting or out.startswith(("Still going", "You are already"))
+                if out.startswith(("Still going", "Queued")):
+                    waiting = out
             if waiting:
                 # a small model fills a wait with chatter: say one line and go quiet until [done]
-                line = "Still on it, I'll tell you when it's done."
+                line = "Got it, that's next after what I'm on now." if waiting.startswith("Queued") else "Still on it, I'll tell you when it's done."
                 history.append({"role": "assistant", "content": line})
                 say(line, gen)
                 break
@@ -326,6 +311,8 @@ def hear_loop(vad, asr, mic):
             else:
                 x = np.zeros_like(x)  # ponytail: half-duplex gate, not echo cancellation
         vad.accept_waveform(x)
+        if not speaking and vad.is_speech_detected():
+            state["heard_at"] = time.time()
         now = time.time()
         if now - last > 0.1:
             emit(mode="speaking" if speaking else "listening", level=round(state["level"], 3))
@@ -351,14 +338,15 @@ def serve():
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             try:
-                if self.path == "/result" and body.get("id") == pending["id"]:
-                    threading.Thread(target=finished, args=(body.get("text", ""),), daemon=True).start()
+                if self.path == "/result":
+                    jobs.finished(body.get("id"), body.get("text", ""))
                 elif self.path == "/progress":
-                    state["progress"] = body.get("text", "")
+                    jobs.progress(body.get("text", ""), body.get("id"))
                 elif self.path == "/note":
                     history.append({"role": "system", "content": body.get("text", "")})
                 elif self.path == "/say" and TEXT:
                     emit(you=body.get("text", ""))
+                    state["heard_at"] = time.time()
                     interrupt()
                     threading.Thread(target=turn, args=(body.get("text", ""),), daemon=True).start()
                 elif self.path == "/quit":
