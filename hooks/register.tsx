@@ -44,15 +44,18 @@ const python = async ($: EngineInterface) => {
   const home = (await $.env.get('HOME')) ?? '/tmp'
   const venv = `${home}/.cache/claude-voice/venv`
   const py = `${venv}/bin/python`
-  const ok = await $.process.run([py, '-c', 'import sherpa_onnx, pyaudio, numpy, elevenlabs']).catch(() => undefined)
-  if (ok?.exitCode === 0) return py
+  const check = () =>
+    $.process.run([py, '-c', 'import sherpa_onnx, pyaudio, numpy, elevenlabs'], { timeoutMs: 120_000 }).catch(() => undefined)
+  if ((await check())?.exitCode === 0) return py
   await patch($, { note: 'setting up Python packages (first run, about a minute)…' })
   const req = `${$.plugin.root}/requirements.txt`
-  const uv = await $.process.run(['uv', '--version']).catch(() => undefined)
-  const made = uv?.exitCode === 0
-    ? await $.process.run(['sh', '-c', `mkdir -p "${home}/.cache/claude-voice" && uv venv -q "${venv}" && uv pip install -q -p "${py}" -r "${req}"`], { timeoutMs: 600_000 })
-    : await $.process.run(['sh', '-c', `mkdir -p "${home}/.cache/claude-voice" && python3 -m venv "${venv}" && "${venv}/bin/pip" install -q -r "${req}"`], { timeoutMs: 600_000 })
-  if (made.exitCode !== 0) throw new Error(`Python setup failed: ${made.stderr.slice(-400)}`)
+  const exists = (await $.fs.exists(py).catch(() => false)) === true
+  const uv = (await $.process.run(['uv', '--version']).catch(() => undefined))?.exitCode === 0
+  // An environment that is there is only topped up, never rebuilt.
+  const make = exists ? '' : uv ? `uv venv -q "${venv}" && ` : `python3 -m venv "${venv}" && `
+  const install = uv ? `uv pip install -q -p "${py}" -r "${req}"` : `"${py}" -m pip install -q -r "${req}"`
+  const made = await $.process.run(['sh', '-c', `mkdir -p "${home}/.cache/claude-voice" && ${make}${install}`], { timeoutMs: 600_000 })
+  if (made.exitCode !== 0 || (await check())?.exitCode !== 0) throw new Error(`Python setup failed: ${made.stderr.slice(-400)}`)
   return py
 }
 

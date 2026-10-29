@@ -26,7 +26,7 @@ test("the agent's ask reaches the chat and Claude's answer reaches the agent", a
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.command.run({ command: 'call', args: '' })
-  await new Promise(r => setTimeout(r, 50))
+  for (let i = 0; i < 200 && !submitted.length; i++) await new Promise(r => setTimeout(r, 25))
   expect(submitted).toContain('run the tests')
 
   await $.turn.complete({ reason: 'answer', answer: 'All green.' } as never)

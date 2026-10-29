@@ -28,6 +28,7 @@ proc = subprocess.Popen([PY, "-I", AGENT], env=env, stdout=subprocess.PIPE, stde
 port = [0]
 t0 = time.time()
 quiet_at = [time.time()]
+greeted = [False]
 
 
 def post(path, body):
@@ -56,7 +57,7 @@ def reader():
         elif "agent_id" in msg:
             open(store, "w").write(msg["agent_id"])
         elif "voice" in msg:
-            print(f"  [{time.time() - t0:5.1f}s] voice: {msg['voice']}", flush=True); quiet_at[0] = time.time()
+            print(f"  [{time.time() - t0:5.1f}s] voice: {msg['voice']}", flush=True); quiet_at[0] = time.time(); greeted[0] = True
         elif "ask" in msg:
             threading.Thread(target=do, args=(msg["ask"],), daemon=True).start()
         elif "note" in msg and msg["note"]:
@@ -68,7 +69,9 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 while not port[0] and proc.poll() is None:
     time.sleep(0.2)
-time.sleep(6 if BACKEND != "local" else 3)  # setup + greeting
+deadline = time.time() + 120  # setup + greeting; slow machines take longer
+while not greeted[0] and time.time() < deadline:
+    time.sleep(0.5)
 for line in lines:
     print(f"[{time.time() - t0:5.1f}s] you: {line}", flush=True)
     post("/say", {"text": line})

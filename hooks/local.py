@@ -191,9 +191,16 @@ def turn(user_text):
 def speak_stream(gen):
     """Streams one assistant message from Ollama, speaking each sentence as it completes."""
     text, calls, buf = "", [], ""
+    first = threading.Event()
+
+    def filler():  # a cold or busy model can take seconds: never leave dead air on a call
+        if not first.wait(2.5) and gen == state["gen"]:
+            say("One sec.", gen)
+    threading.Thread(target=filler, daemon=True).start()
     try:
         with ollama(history_with_prompt(), True) as r:
             for line in r:
+                first.set()
                 if gen != state["gen"]:
                     break
                 d = json.loads(line)
@@ -215,6 +222,7 @@ def speak_stream(gen):
     except (OSError, ValueError) as e:
         emit(error=f"ollama: {e}")
         say("Sorry, my local model isn't answering right now.", gen)
+    first.set()
     if buf.strip():
         say(buf.strip(), gen)
     return text, calls
@@ -357,7 +365,12 @@ def main():
         vad, asr, tts = load_models()
         player["tts"] = tts
         signal.signal(signal.SIGTERM, lambda *_: state.update(live=False))
-        threading.Thread(target=lambda: ollama([{"role": "user", "content": "hi"}], False).read(), daemon=True).start()  # warm the model
+        # load the talker before greeting, so the first reply is not a cold start (can take a minute on a busy Mac)
+        emit(note="warming up the voice model")
+        try:
+            ollama([{"role": "user", "content": "hi"}], False).read()
+        except OSError as e:
+            emit(error=f"ollama: {e} (is `{LLM}` pulled? `ollama pull {LLM}`)"); return 2
         emit(note="")
         greeting = "Hey. What are we working on?"
         history.append({"role": "assistant", "content": greeting})
