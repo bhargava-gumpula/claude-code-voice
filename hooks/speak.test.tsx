@@ -11,7 +11,7 @@ test("the agent's ask reaches the chat and Claude's answer reaches the agent", a
   on('store.set', () => ({ value: undefined }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
   on('process.spawn', async function* () {
-    yield { stream: 'stdout' as const, text: '{"port": 4242}\n{"ask": {"id": "a1", "task": "run the tests"}}\n' }
+    yield { stream: 'stdout' as const, text: '{"port": 4242}\n{"ask": {"id": "a1", "task": "run the tests"}}\n{"ask": {"id": "a2", "task": "update the README"}}\n' }
     await new Promise(() => undefined)
   })
   on('prompt.submit', (_, e) => {
@@ -31,4 +31,10 @@ test("the agent's ask reaches the chat and Claude's answer reaches the agent", a
 
   await $.turn.complete({ reason: 'answer', answer: 'All green.' } as never)
   expect(posted.some(p => p.includes('127.0.0.1:4242/result') && p.includes('"a1"') && p.includes('All green.'))).toBe(true)
+
+  // two asks in a row: Claude runs them in order, and each answer goes back to its own ask
+  for (let i = 0; i < 200 && submitted.length < 2; i++) await new Promise(r => setTimeout(r, 25))
+  expect(submitted).toContain('update the README')
+  await $.turn.complete({ reason: 'answer', answer: 'README done.' } as never)
+  expect(posted.some(p => p.includes('/result') && p.includes('"a2"') && p.includes('README done.'))).toBe(true)
 })
