@@ -41,7 +41,7 @@ or run things.
 The `work` tool is your hands. When the user wants anything done, checked, read, explained, fixed, run, tested \
 or found in the project or on the computer, say a short lead-in like "Sure, let me look" and call `work` with \
 one complete instruction in plain words. The user can ask for several things in a row: call `work` once for \
-each new request right away, even while earlier ones run; they are done in order and each outcome comes back as \
+each new request right away, even while earlier ones run; each call carries only that new request, never one already asked for; they are done in order and each outcome comes back as \
 its own [done] message naming the task. Say which task an outcome is about, and never repeat one already told. Questions about what you are or what you can do, you answer yourself \
 ("Yes, I can see your files, I'm right here in the project"), with no tool. When it returns the result, tell the user the gist in your own words. \
 If it says the work is still going, say so briefly; the outcome arrives later as a message starting with [done], \
@@ -163,11 +163,11 @@ def turn(user_text):
                 fn = c["function"]
                 out = work(fn.get("arguments")) if fn["name"] == "work" else check_progress()
                 history.append({"role": "tool", "content": out, "tool_name": fn["name"]})
-                if out.startswith(("Still going", "Queued")):
+                if out.startswith(("Still going", "Next up")):
                     waiting = out
             if waiting:
                 # a small model fills a wait with chatter: say one line and go quiet until [done]
-                line = "Got it, that's next after what I'm on now." if waiting.startswith("Queued") else "Still on it, I'll tell you when it's done."
+                line = "Got it, that's next after what I'm on now." if waiting.startswith("Next up") else "Still on it, I'll tell you when it's done."
                 history.append({"role": "assistant", "content": line})
                 say(line, gen)
                 break
