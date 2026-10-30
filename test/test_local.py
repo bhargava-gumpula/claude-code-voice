@@ -20,4 +20,30 @@ class Boom:  # a recognizer that fails like Parakeet does on an empty clip
 
 assert local.hear(Boom(), []) == ""  # too short: skipped
 assert local.hear(Boom(), [0.1] * 16000) == ""  # recognizer error: skipped, call stays up
+
+# stutters and fillers: what the user meant
+c = local.clean
+assert c("Um, can you, can you run the the tests?") == "can you run the tests?", c("Um, can you, can you run the the tests?")
+assert c("I- I want to, uh, t- tell you something.") == "I want to, tell you something.", c("I- I want to, uh, t- tell you something.")
+assert c("Uh, what's in calc.py?") == "what's in calc.py?", c("Uh, what's in calc.py?")
+assert c("that that is fine") == "that is fine"
+assert c("It's a bye bye function.") == "It's a bye function."  # ponytail: real repeats get folded too; harmless for the talker
+# does it sound finished?
+f = local.finished_sentence
+assert f("Can you run the tests?") and f("Thanks.")
+assert not f("Can you check the.") and not f("so I was thinking and") and not f("Run the tests and uh.") and not f("hmm")
+# a pause mid-sentence: the clips join, and an answer to the first half is taken back
+local.state["asked"] = False
+local.ear.update(text="", last=None)
+local.heard("Can you check the")
+assert local.ear["text"] == "Can you check the" and local.ear["due"] - local.time.time() > 1
+local.ear.update(text="", last={"text": "Can you check the", "at": local.time.time()})
+local.heard("readme for typos?")
+assert local.ear["text"] == "Can you check the readme for typos?" and local.ear["replaces"] == "Can you check the"
+# once work went out for it, a new clip is a new request
+local.state["asked"] = True
+local.ear.update(text="", last={"text": "Run the tests.", "at": local.time.time()})
+local.ear.pop("replaces", None)
+local.heard("Also fix the lint.")
+assert local.ear["text"] == "Also fix the lint." and "replaces" not in local.ear
 print("ok")
