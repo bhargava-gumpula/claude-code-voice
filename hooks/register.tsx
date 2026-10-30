@@ -16,7 +16,10 @@ const SPOKEN =
 let port = 0
 let ending = false
 let quickFails = 0 // restarts that died again within 20s; three in a row and we stop
-let pendingId = '' // the agent's ask that Claude is working on
+// Claude's turns in the order they will run: an ask's id, or '' for a prompt typed in the chat.
+// Prompts submitted while Claude is busy wait their turn, so turn.complete answers the head.
+let turns: string[] = []
+const working = () => turns.some(Boolean)
 let cwd = ''
 let lastProgress = 0
 
@@ -64,6 +67,7 @@ const hangUp = async ($: EngineInterface) => {
   ending = true
   await post($, '/quit')
   port = 0
+  turns = []
   await update($, call, () => OFF)
 }
 
@@ -90,6 +94,7 @@ const start = async ($: EngineInterface, asked = '', resume = false) => {
   if (!resume) {
     ending = false
     quickFails = 0
+    turns = []
   }
   let py: string
   try {
@@ -149,7 +154,7 @@ const start = async ($: EngineInterface, asked = '', resume = false) => {
             $.ui.log(`🔊 voice: ${msg.voice}`)
             await patch($, { last: msg.voice })
           } else if (msg.ask) {
-            pendingId = msg.ask.id
+            turns.push(msg.ask.id)
             await patch($, { mode: 'thinking' })
             void $.prompt.submit({ text: msg.ask.task, asUser: true })
           } else if (msg.note !== undefined) {
@@ -158,7 +163,7 @@ const start = async ($: EngineInterface, asked = '', resume = false) => {
             $.ui.toast(`voice: ${msg.error}`)
           } else if (msg.mode) {
             const now = Date.now()
-            const mode: Mode = msg.mode === 'speaking' ? 'speaking' : pendingId ? 'thinking' : 'listening'
+            const mode: Mode = msg.mode === 'speaking' ? 'speaking' : working() ? 'thinking' : 'listening'
             const c = await read($, call)
             // ponytail: redraw at most ~8 fps and only when the orb would visibly move
             if (c.mode !== mode || (now - lastDraw > 120 && Math.abs((msg.level ?? 0) - c.level) > 0.02)) {
@@ -218,6 +223,7 @@ export const register: Register = on => {
   // answers to them reach the voice as context, and each tool call while it waits becomes a progress line.
   on('prompt.submit', async ($, e, next) => {
     if (port && e.origin.kind !== 'plugin' && e.text.trim()) {
+      if (working() && !e.text.trim().startsWith('/')) turns.push('')
       void post($, '/note', { text: `[chat] The user just typed in the chat: ${e.text.slice(0, 600)}` })
     }
     return next(e)
@@ -225,9 +231,9 @@ export const register: Register = on => {
 
   on('tool.call', async ($, e, next) => {
     const now = Date.now()
-    if (port && pendingId && e.agentId === undefined && now - lastProgress > 2500) {
+    if (port && turns[0] && e.agentId === undefined && now - lastProgress > 2500) {
       lastProgress = now
-      void post($, '/progress', { text: describe(e) })
+      void post($, '/progress', { id: turns[0], text: describe(e) })
     }
     return next(e)
   })
@@ -235,10 +241,9 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && port) {
       const answer = e.reason === 'answer' && e.answer.trim() ? e.answer.slice(0, 4000) : `Claude Code's turn ended without an answer (${e.reason}).`
-      if (pendingId) {
-        const id = pendingId
-        pendingId = ''
-        await patch($, { mode: 'listening' })
+      const id = turns.shift()
+      if (id) {
+        if (!working()) await patch($, { mode: 'listening' })
         void post($, '/result', { id, text: answer })
       } else if (e.reason === 'answer' && e.answer.trim()) {
         void post($, '/note', { text: `[chat] You just answered in the chat: ${e.answer.slice(0, 800)}` })
