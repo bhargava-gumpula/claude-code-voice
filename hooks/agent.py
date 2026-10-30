@@ -206,6 +206,30 @@ class Silent(AudioInterface):
         state["play_until"] = 0.0
 
 
+class FileAudio(Silent):
+    """Tests: VOICE_MIC_FILE (16 kHz mono wav) stands in for the mic, in real time once the greeting has played,
+    then silence. Nothing is played out loud; playback time is still tracked, so turn-taking is real."""
+    def start(self, input_callback):
+        import wave
+        with wave.open(os.environ["VOICE_MIC_FILE"]) as w:
+            pcm = w.readframes(w.getnframes())
+        self.live = True
+
+        def feed():
+            while not state["play_until"] or time.time() < state["play_until"] + 0.5:
+                input_callback(bytes(8000)); time.sleep(0.25)
+            t, i = time.time(), 0
+            while self.live and state["live"]:
+                chunk = pcm[i:i + 8000].ljust(8000, b"\0")
+                i += 8000
+                if any(chunk):
+                    state["heard_at"] = time.time()
+                input_callback(chunk)
+                t += 0.25
+                time.sleep(max(0.0, t - time.time()))
+        threading.Thread(target=feed, daemon=True).start()
+
+
 def reporter():
     while state["live"]:
         emit(mode="speaking" if time.time() < state["play_until"] else "listening", level=round(state["level"], 3))
@@ -271,7 +295,7 @@ def main():
         tools.register("check_progress", check_progress)
         conv = Conversation(
             ElevenLabs(api_key=KEY), AGENT, requires_auth=True,
-            audio_interface=Silent() if TEXT else Audio(), client_tools=tools,
+            audio_interface=FileAudio() if os.environ.get("VOICE_MIC_FILE") else Silent() if TEXT else Audio(), client_tools=tools,
             config=ConversationInitiationData(conversation_config_override={"agent": {"first_message": "Sorry, I dropped for a second. I'm back."}}) if os.environ.get("VOICE_RESUME") else None,
             callback_user_transcript=lambda t: (state.update(heard_at=time.time()), emit(you=t)),
             callback_agent_response=lambda r: emit(voice=r),
