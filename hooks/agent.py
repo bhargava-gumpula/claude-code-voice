@@ -69,6 +69,11 @@ language: no lists, no markdown, no symbols, no code read aloud, no file paths u
 names said the way a person says them. Match the user's energy and pace, be direct, skip filler and repetition, \
 and ask one short question when something is unclear. Being interrupted is fine; pick up where it makes sense.
 
+Questions about yourself or what you can do ("can you see my files?", "do you have access to my \
+terminal?", "can you run code?") you answer yourself, in one sentence, yes: never call `work` to check, and never \
+start work nobody asked for. If what the user said sounds unfinished (they paused mid-sentence: "I want you to count...", "so the \
+thing is"), call `skip_turn` and say nothing; answer once they finish. If you get cut off, never apologize or mention it; just respond to what they said.
+
 Never talk about how you work inside: no mentions of tools, hands, handing off, systems or chat windows. You \
 just do things and report back. If the user goes quiet, stay quiet; never ask whether they are still there.
 
@@ -111,10 +116,13 @@ def api(method, path, body=None):
 def agent_config():
     return {
         "agent": {"first_message": "Hey. What are we working on?", "language": "en",
-                  "prompt": {"prompt": PROMPT, "llm": LLM, "temperature": 0.3, "tools": TOOLS}},
+                  "prompt": {"prompt": PROMPT, "llm": LLM, "temperature": 0.3, "tools": TOOLS,
+                             # lets it stay silent when the user pauses mid-sentence
+                             "built_in_tools": {"skip_turn": {"name": "skip_turn", "description": "",
+                                                              "params": {"system_tool_type": "skip_turn"}}}}},
         "tts": {"model_id": "eleven_turbo_v2", "voice_id": VOICE, "stability": 0.45, "similarity_boost": 0.85,
                 "speed": 1.0, "optimize_streaming_latency": 3},
-        "turn": {"mode": "turn", "turn_timeout": -1, "turn_eagerness": "normal", "silence_end_call_timeout": -1},
+        "turn": {"mode": "turn", "turn_timeout": -1, "turn_eagerness": "patient", "silence_end_call_timeout": -1},
         "conversation": {"max_duration_seconds": 7200,
                          "client_events": ["audio", "interruption", "agent_response", "user_transcript",
                                            "agent_response_correction", "agent_tool_response"]},
@@ -280,7 +288,7 @@ def project_context():
         branch = subprocess.run(["git", "-C", PROJECT, "branch", "--show-current"], capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         branch = ""
-    return f"[context] You are working in the project \"{name}\"" + (f" on branch {branch}" if branch else "") + \
+    return f"[context] Background, never to be mentioned unless the user asks: you are working in the project \"{name}\"" + (f" on branch {branch}" if branch else "") + \
            f" (folder {PROJECT}). The user is also looking at your chat window where your work shows up."
 
 
