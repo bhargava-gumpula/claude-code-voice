@@ -3,6 +3,7 @@
 really doing the work (`claude -p` in a project), no microphone.
 
   python3 test/live.py <project-folder> "first thing to say" ["next thing" ...]
+  VOICE_MIC_FILE=talk.wav python3 test/live.py <project-folder>   (hears a recording; see test/make_audio.py)
   VOICE_BACKEND=local (default: elevenlabs) picks the helper: local.py needs Ollama running.
 
 Plays the part of the mod: every ask the agent makes is run through `claude -p` in the project and
@@ -17,7 +18,9 @@ AGENT = os.path.join(HERE, "..", "hooks", "local.py" if BACKEND == "local" else 
 PY = os.path.expanduser("~/.cache/claude-voice/venv/bin/python")
 project, lines = sys.argv[1], sys.argv[2:]
 
-env = dict(os.environ, VOICE_TEXT="1", VOICE_PROJECT=project)
+env = dict(os.environ, VOICE_PROJECT=project)
+if not env.get("VOICE_MIC_FILE"):  # MIC_FILE: the voice hears that recording instead of typed lines
+    env["VOICE_TEXT"] = "1"
 if BACKEND != "local" and not env.get("ELEVENLABS_API_KEY"):
     env["ELEVENLABS_API_KEY"] = json.load(open(os.path.expanduser("~/.claude/settings.json")))["env"]["ELEVENLABS_API_KEY"]
 store = os.path.join(HERE, ".agent_id")
@@ -67,6 +70,8 @@ def reader():
             open(store, "w").write(msg["agent_id"])
         elif "voice" in msg:
             print(f"  [{time.time() - t0:5.1f}s] voice: {msg['voice']}", flush=True); quiet_at[0] = time.time(); greeted[0] = True
+        elif "you" in msg and os.environ.get("VOICE_MIC_FILE"):
+            print(f"  [{time.time() - t0:5.1f}s] heard: {msg['you']}", flush=True); quiet_at[0] = time.time()
         elif "ask" in msg:
             threading.Thread(target=do, args=(msg["ask"],), daemon=True).start()
         elif "note" in msg and msg["note"]:
