@@ -40,6 +40,7 @@ claude_lock = threading.Lock()  # Claude Code runs queued prompts one at a time,
 
 
 def do(ask):
+    print(f"  [{time.time() - t0:5.1f}s] queued: {ask['task']}", flush=True)
     with claude_lock:
         run(ask)
 
@@ -47,7 +48,7 @@ def do(ask):
 def run(ask):
     print(f"  [{time.time() - t0:5.1f}s] ask -> claude -p: {ask['task']}", flush=True)
     post("/progress", {"text": "reading the project"})
-    ran = subprocess.run(["claude", "-p", ask["task"], "--permission-mode", "acceptEdits", "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git branch:*),Bash(ls:*),Bash(wc:*),Bash(find:*)"], cwd=project,
+    ran = subprocess.run(["claude", "-p", ask["task"], *(["--model", os.environ["CLAUDE_MODEL"]] if os.environ.get("CLAUDE_MODEL") else []), "--permission-mode", "acceptEdits", "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git branch:*),Bash(ls:*),Bash(wc:*),Bash(find:*)"], cwd=project,
                          capture_output=True, text=True, timeout=300)
     text = (ran.stdout or ran.stderr).strip()[-3000:]
     print(f"  [{time.time() - t0:5.1f}s] claude -p done ({len(text)} chars)", flush=True)
@@ -84,9 +85,12 @@ for line in lines:
     print(f"[{time.time() - t0:5.1f}s] you: {line}", flush=True)
     post("/say", {"text": line})
     quiet_at[0] = time.time()
-    time.sleep(3)
+    time.sleep(float(os.environ.get("GAP", "3")))
     while time.time() - quiet_at[0] < float(os.environ.get("QUIET", "12")):
         time.sleep(0.5)
+quiet_at[0] = time.time()  # TAIL: how long to wait for late outcomes after the last line
+while time.time() - quiet_at[0] < float(os.environ.get("TAIL", os.environ.get("QUIET", "12"))):
+    time.sleep(0.5)
 post("/quit", {})
 try:
     proc.wait(timeout=10)
