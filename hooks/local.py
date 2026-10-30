@@ -42,8 +42,9 @@ The `work` tool is your hands. When the user wants anything done, checked, read,
 or found in the project or on the computer, say a short lead-in like "Sure, let me look" and call `work` with \
 one complete instruction in plain words. The user can ask for several things in a row: call `work` once for \
 each new request right away, even while earlier ones run; each call carries only that new request, never one already asked for; they are done in order and each outcome comes back as \
-its own [done] message naming the task. Say which task an outcome is about, and never repeat one already told. Questions about what you are or what you can do, you answer yourself \
-("Yes, I can see your files, I'm right here in the project"), with no tool. When it returns the result, tell the user the gist in your own words. \
+its own [done] message naming the task. Say which task an outcome is about, and never repeat one already told. Questions about yourself or what you can do ("can you see my files?", \
+"do you have access?", "can you run code?") are not requests: answer them yourself in one sentence ("Yes, I can \
+see your files, I'm right here in the project") and NEVER call `work` for them or start work nobody asked for. When it returns the result, tell the user the gist in your own words. \
 If it says the work is still going, say so briefly; the outcome arrives later as a message starting with [done], \
 then tell the user what happened. Small talk, opinions and general questions you answer yourself, no tools.
 
@@ -133,9 +134,17 @@ jobs = Jobs(emit, lambda text: turn(text), idle, WAIT)
 
 # ---- the talker (Ollama) ---------------------------------------------------------
 
-def ollama(messages, stream):
-    body = {"model": LLM, "messages": messages, "tools": TOOLS, "stream": stream, "think": False,
-            "keep_alive": "30m", "options": {"temperature": 0.4, "num_ctx": 8192}}
+# "Can you see my files?" asks what it can do, not for work; a small model still reaches for `work`, so for
+# these it gets no tools. "Can you read calc.py?" names a thing and stays a request.
+CAPABILITY = re.compile(r"^(?:hey,? |so,? |um,? )*(?:can|could|do|are) you(?: even)? (?:see|access|read|reach|open|"
+                        r"have access to|(?:be )?able to (?:see|access|read|use)|use)(?: all)? (?:my|the|this|your|our) "
+                        r"(?:files?|project|code|codebase|repo|repository|folder|computer|terminal|screen|machine|stuff)\b"
+                        r"[\w\s,']{0,20}\??$", re.I)
+
+
+def ollama(messages, stream, tools=True):
+    body = {"model": LLM, "messages": messages, "tools": TOOLS if tools else [], "stream": stream, "think": False,
+            "keep_alive": "60m", "options": {"temperature": 0.4, "num_ctx": 8192}}
     req = urllib.request.Request(f"{OLLAMA}/api/chat", json.dumps(body).encode(), {"Content-Type": "application/json"})
     return urllib.request.urlopen(req, timeout=120)
 
@@ -154,7 +163,7 @@ def turn(user_text, replaces=None):
         gen = state["gen"]
         state["acked"] = False
         for _ in range(4):  # tool rounds
-            text, calls = speak_stream(gen)
+            text, calls = speak_stream(gen, tools=not CAPABILITY.match(user_text.strip()))
             if gen != state["gen"]:
                 return  # interrupted
             msg = {"role": "assistant", "content": text}
@@ -183,7 +192,7 @@ def turn(user_text, replaces=None):
         del history[:-40]
 
 
-def speak_stream(gen):
+def speak_stream(gen, tools=True):
     """Streams one assistant message from Ollama, speaking each sentence as it completes."""
     text, calls, buf = "", [], ""
     first = threading.Event()
@@ -193,7 +202,7 @@ def speak_stream(gen):
             say("One sec.", gen)
     threading.Thread(target=filler, daemon=True).start()
     try:
-        with ollama(history_with_prompt(), True) as r:
+        with ollama(history_with_prompt(), True, tools) as r:
             for line in r:
                 first.set()
                 if gen != state["gen"]:
@@ -234,6 +243,7 @@ player = {"tts": None, "out": None}
 
 def spoken(text):
     """Markdown and code marks read badly aloud: drop them."""
+    text = re.sub(r"\[(?:done|progress|chat|context)\]\s*", "", text, flags=re.I)  # tags it copies from its inputs
     text = re.sub(r"[`*_#>]+", "", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -477,7 +487,7 @@ def project_context():
         branch = subprocess.run(["git", "-C", PROJECT, "branch", "--show-current"], capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         branch = ""
-    return f"[context] You are working in the project \"{name}\"" + (f" on branch {branch}" if branch else "") + f" (folder {PROJECT})."
+    return f"[context] Background, never to be mentioned unless the user asks: you are working in the project \"{name}\"" + (f" on branch {branch}" if branch else "") + f" (folder {PROJECT})."
 
 
 def main():
@@ -496,7 +506,8 @@ def main():
         # load the talker before greeting, so the first reply is not a cold start (can take a minute on a busy Mac)
         emit(note="warming up the voice model")
         try:
-            ollama([{"role": "user", "content": "hi"}], False).read()
+            # the real system prompt and tools, so Ollama caches them and every turn skips re-reading ~1k tokens
+            ollama(history_with_prompt() + [{"role": "user", "content": "hi"}], False).read()
         except OSError as e:
             emit(error=f"ollama: {e} (is `{LLM}` pulled? `ollama pull {LLM}`)"); return 2
         emit(note="")
