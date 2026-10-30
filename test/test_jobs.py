@@ -30,7 +30,7 @@ assert len(told) == 1, told
 # task 1 then task 2 straight after: both go to Claude, the second is queued behind the first
 told.clear(); asks.clear()
 assert jobs.work("run the tests").startswith("Still going")
-assert jobs.work("update the README").startswith("Queued: it starts after the 1 thing")
+assert jobs.work("update the README").startswith("Next up")
 assert [a["task"] for a in asks] == ["run the tests", "update the README"]
 assert 'Working on "run the tests"' in jobs.check() and 'Then "update the README"' in jobs.check()
 
@@ -64,4 +64,11 @@ told.clear()
 jobs.finished("unknown-id", "deployed")
 assert until(lambda: len(told) == 1) and "deployed" in told[0]
 assert jobs.check() == "Nothing is being worked on right now."
+
+# the talker restating a request it already made does not run it twice
+asks.clear()
+jobs.work("In the project folder, count the commits on branch main and report the number.")
+assert jobs.work("Count the commits on branch main.").startswith("Already on it")
+assert jobs.work("Count the commits on main, then list the functions in calc.py.").startswith("Not started")
+assert jobs.work("list the functions in calc.py").startswith("Next up") and len(asks) == 2
 print("ok")
