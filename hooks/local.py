@@ -32,34 +32,29 @@ ASR = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 TTS = "kokoro-multi-lang-v1_0"
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
-PROMPT = """You are Claude Code, talking with your user out loud. This voice is you: the same Claude Code that \
-lives in their terminal, with full access to their computer, this project, its files, the terminal, git, the \
-browser and the internet. Anything Claude Code can do, you can do, because you are Claude Code. Never say you \
-are separate from Claude Code, never say you will ask or hand off to anything, never say you cannot see files \
-or run things.
+# Short on purpose: Ollama re-reads the whole prompt every turn (no cache for qwen3.5), ~2.5ms a token.
+PROMPT = """You are Claude Code, talking with the user out loud: the same Claude Code as in their terminal, with \
+full access to this project, the computer, git and the web. Never say you are separate from it or can't see things.
 
-The `work` tool is your hands. When the user wants anything done, checked, read, explained, fixed, run, tested \
-or found in the project or on the computer, say a short lead-in like "Sure, let me look" and call `work` with \
-one complete instruction in plain words. The user can ask for several things in a row: call `work` once for \
-each new request right away, even while earlier ones run; each call carries only that new request, never one already asked for; they are done in order and each outcome comes back as \
-its own [done] message naming the task. Say which task an outcome is about, and never repeat one already told. Questions about yourself or what you can do ("can you see my files?", \
-"do you have access?", "can you run code?") are not requests: answer them yourself in one sentence ("Yes, I can \
-see your files, I'm right here in the project") and NEVER call `work` for them or start work nobody asked for. When it returns the result, tell the user the gist in your own words. \
-If it says the work is still going, say so briefly; the outcome arrives later as a message starting with [done], \
-then tell the user what happened. Small talk, opinions and general questions you answer yourself, no tools.
+`work` is your hands. When the user wants something done, read, checked, run or found, say two or three words \
+("On it.") and call `work` once with that one request in plain words. Several requests in a row get one call \
+each, right away; never resend one already asked. Each outcome arrives as its own [done] message: say which \
+request it answers, once. While work runs, stay quiet.
 
-Messages starting with [done], [progress], [chat] or [context] are your own work and chat window reporting in, \
-never the user: use them, never read them back or thank anyone.
+Answer yourself, with no tools: small talk, opinions, general questions, and questions about you ("can you see \
+my files?" -> "Yes, I'm right here in your project.").
 
-Style: a sharp, warm colleague on a call. One to three short sentences. Plain spoken words: no lists, no \
-markdown, no symbols, no code, no file paths unless they matter. Never mention tools, hands or how you work. \
-If the user is quiet, stay quiet. Never invent a result. Confirm before anything destructive or outward-facing. \
-If something truly cannot be done, say so once and offer the nearest thing."""
+[done], [progress], [chat] and [context] messages are your own work reporting in, not the user: use them, never \
+read them out. Background in [context] is never mentioned unless asked.
+
+Style: a warm, sharp colleague. One short sentence, two at most. Spoken words only: no lists, symbols, code or \
+paths. Never mention tools or how you work. If the user is quiet, stay quiet. Never invent results. Confirm \
+before anything destructive or public."""
 
 TOOLS = [
-    {"type": "function", "function": {"name": "work", "description": "Do something in the user's project or on their computer: read, explain, search, edit, create, run, test, git, browse. Returns the result or says the work is still going.",
-                                      "parameters": {"type": "object", "required": ["instruction"], "properties": {"instruction": {"type": "string", "description": "One complete instruction in plain words."}}}}},
-    {"type": "function", "function": {"name": "check_progress", "description": "What the current piece of work is doing right now, and its result if it just finished.",
+    {"type": "function", "function": {"name": "work", "description": "Do something in the project or on the computer.",
+                                      "parameters": {"type": "object", "required": ["instruction"], "properties": {"instruction": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "check_progress", "description": "How the running work is going.",
                                       "parameters": {"type": "object", "properties": {}}}},
 ]
 
@@ -184,10 +179,10 @@ def turn(user_text, replaces=None):
                 if out.startswith(("Still going", "Next up")):
                     waiting = out
             if waiting:
-                # a small model fills a wait with chatter: say one line and go quiet until [done]
-                line = "Got it, that's next after what I'm on now." if waiting.startswith("Next up") else "Still on it, I'll tell you when it's done."
-                history.append({"role": "assistant", "content": line})
-                say(line, gen)
+                # it already said "On it": a small model fills the wait with chatter, so it gets no turn now
+                if waiting.startswith("Next up"):
+                    history.append({"role": "assistant", "content": "Got it, I'll do that too."})
+                    say("Got it, I'll do that too.", gen)
                 break
         del history[:-40]
 
@@ -198,7 +193,7 @@ def speak_stream(gen, tools=True):
     first = threading.Event()
 
     def filler():  # a cold or busy model can take seconds: never leave dead air on a call
-        if not first.wait(2.5) and gen == state["gen"] and not state["acked"]:
+        if not first.wait(3.5) and gen == state["gen"] and not state["acked"]:
             say("One sec.", gen)
     threading.Thread(target=filler, daemon=True).start()
     try:
@@ -238,7 +233,7 @@ def history_with_prompt():
 
 # ---- the mouth --------------------------------------------------------------------------
 
-player = {"tts": None, "out": None}
+player = {"tts": None, "out": None, "synth": threading.Lock(), "queue": queue.Queue()}
 
 
 def spoken(text):
@@ -250,6 +245,8 @@ def spoken(text):
 
 
 def say(sentence, gen):
+    """Speaks one sentence. Returns once its audio is made and queued, so the next sentence is synthesised
+    while this one plays: no gap between sentences."""
     sentence = spoken(sentence)
     if not sentence:
         return
@@ -261,19 +258,26 @@ def say(sentence, gen):
         if player["out"]:
             break
         time.sleep(0.1)
-    audio = player["tts"].generate(sentence, sid=SPEAKER, speed=1.05)
-    if gen != state["gen"]:
-        return
-    pcm = (np.clip(np.asarray(audio.samples), -1, 1) * 32767).astype(np.int16).tobytes()
-    state["play_until"] = max(time.time(), state["play_until"]) + len(pcm) / 2 / audio.sample_rate
-    for i in range(0, len(pcm), 4800):  # small writes so an interruption stops within ~100 ms
-        out = player["out"]
-        if gen != state["gen"] or not out:
-            break
-        try:
-            out.write(pcm[i:i + 4800])
-        except OSError:
-            break  # speaker went away mid-sentence; listen() reopens it
+    with player["synth"]:  # one sentence at a time, in order
+        audio = player["tts"].generate(sentence, sid=SPEAKER, speed=1.05)
+        if gen != state["gen"]:
+            return
+        pcm = (np.clip(np.asarray(audio.samples), -1, 1) * 32767).astype(np.int16).tobytes()
+        state["play_until"] = max(time.time(), state["play_until"]) + len(pcm) / 2 / audio.sample_rate
+        player["queue"].put((gen, pcm))
+
+
+def mouth():
+    while True:
+        gen, pcm = player["queue"].get()
+        for i in range(0, len(pcm), 4800):  # small writes so an interruption stops within ~100 ms
+            out = player["out"]
+            if gen != state["gen"] or not out:
+                break
+            try:
+                out.write(pcm[i:i + 4800])
+            except OSError:
+                break  # speaker went away mid-sentence; listen() reopens it
 
 
 def interrupt():
@@ -487,12 +491,13 @@ def project_context():
         branch = subprocess.run(["git", "-C", PROJECT, "branch", "--show-current"], capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         branch = ""
-    return f"[context] Background, never to be mentioned unless the user asks: you are working in the project \"{name}\"" + (f" on branch {branch}" if branch else "") + f" (folder {PROJECT})."
+    return f"[context] Project \"{name}\"" + (f", branch {branch}." if branch else ".")
 
 
 def main():
     srv = serve()
     threading.Thread(target=assembler, daemon=True).start()
+    threading.Thread(target=mouth, daemon=True).start()
     try:
         try:
             urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=3).read()
