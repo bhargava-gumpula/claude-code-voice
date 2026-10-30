@@ -4,3 +4,4 @@ __pycache__/
 .claude-plugin/types/
 test/.agent_id
 .DS_Store
+test/.audio/
