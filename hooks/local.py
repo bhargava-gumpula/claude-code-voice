@@ -7,7 +7,7 @@ HTTP POST /result {"id","text"}  /progress {"text"}  /note {"text"}  /say {"text
 Env: VOICE_PROJECT, VOICE_TEXT=1, VOICE_LLM (Ollama model, default qwen3.5:4b), VOICE_SPEAKER (Kokoro id),
      OLLAMA_HOST, VOICE_MODELS (folder, default ~/.cache/claude-voice/models), BARGE_LEVEL, VOICE_WAIT, VOICE_RESUME.
 """
-import json, os, re, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
+import collections, json, os, queue, re, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -63,7 +63,7 @@ TOOLS = [
 ]
 
 LEAD_INS = ["Sure, let me look.", "On it.", "One sec, checking.", "Let me take a look."]
-state = {"acked": False, "level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "heard_at": 0.0, "busy": threading.Lock()}
+state = {"transcribing": 0, "asked": False, "acked": False, "level": 0.0, "play_until": 0.0, "live": True, "gen": 0, "heard_at": 0.0, "busy": threading.Lock()}
 history = []
 out_lock = threading.Lock()
 
@@ -140,9 +140,16 @@ def ollama(messages, stream):
     return urllib.request.urlopen(req, timeout=120)
 
 
-def turn(user_text):
-    """One exchange: the user's words in, spoken sentences out, tool calls run in between."""
+def turn(user_text, replaces=None):
+    """One exchange: the user's words in, spoken sentences out, tool calls run in between.
+    replaces: the words of an exchange this one continues (the user paused mid-sentence); it is dropped."""
     with state["busy"]:
+        if replaces:
+            for i in range(len(history) - 1, -1, -1):
+                if history[i]["role"] == "user" and history[i]["content"] == replaces:
+                    del history[i:]
+                    break
+        state["asked"] = False
         history.append({"role": "user", "content": user_text})
         gen = state["gen"]
         state["acked"] = False
@@ -161,6 +168,8 @@ def turn(user_text):
             waiting = False
             for c in calls:
                 fn = c["function"]
+                if fn["name"] == "work":
+                    state["asked"] = True  # work went out: this exchange can no longer be redone
                 out = work(fn.get("arguments")) if fn["name"] == "work" else check_progress()
                 history.append({"role": "tool", "content": out, "tool_name": fn["name"]})
                 if out.startswith(("Still going", "Next up")):
@@ -280,8 +289,87 @@ def hear(asr, samples):
         return ""
 
 
+# Turn-taking. VAD ends a clip after 0.6s of silence, but people pause mid-sentence ("check the... readme")
+# and stutter. Clips are joined into one utterance; it is answered once it sounds finished, or after a longer
+# pause when it does not. If the user carries on after an answer has started, the answer is dropped and the
+# whole sentence answered instead, unless work already went out for it.
+DANGLING = set("and or but so the a an to of with for in on at from about like because then my your our this "
+               "that is are was can could would should will if when um uh er erm hmm".split())
+FILLERS = re.compile(r"\b(?:um+|uh+|erm|uhm|hmm+)\b[,.]?\s*", re.I)
+HOLD_DONE, HOLD_OPEN, CONTINUE_WITHIN = 0.25, 1.4, 6.0
+ear = {"text": "", "due": 0.0, "last": None}  # last: {"text", "at"} of the utterance most recently answered
+
+
+def clean(text):
+    """Drop fillers and stuttered repeats ("the the", "I- I"): what the user meant, not every sound."""
+    text = FILLERS.sub("", text)
+    text = re.sub(r"\b(\w+)-\s+(?=\1)", "", text, flags=re.I)  # "t- tell" -> "tell", "I- I" -> "I"
+    text = re.sub(r"\b(\w+)(?:[,]?\s+\1\b)+", r"\1", text, flags=re.I)  # "the the", "can you, can you"
+    text = re.sub(r"\b(\w+ \w+)(?:[,]?\s+\1\b)+", r"\1", text, flags=re.I)
+    return re.sub(r"\s+([,.?!])", r"\1", re.sub(r"\s+", " ", text)).strip(" ,")
+
+
+def finished_sentence(text):
+    words = re.findall(r"[a-z']+", text.lower())
+    return bool(re.search(r"[.?!]\s*$", text)) and bool(words) and words[-1] not in DANGLING
+
+
+def heard(said):
+    """One clip of the user's speech, from the mic or (text mode) /say."""
+    emit(you=said)
+    now = time.time()
+    state["heard_at"] = now
+    interrupt()
+    last = ear["last"]
+    if not ear["text"] and last and now - last["at"] < CONTINUE_WITHIN and not state["asked"]:
+        ear["text"], ear["replaces"] = last["text"], last["text"]  # still the same sentence: take the answer back
+    ear["text"] = f'{ear["text"]} {said}'.strip()
+    ear["due"] = now + (HOLD_DONE if finished_sentence(ear["text"]) else HOLD_OPEN)
+
+
+def assembler():
+    while state["live"]:
+        time.sleep(0.05)
+        now = time.time()
+        if not ear["text"] or now < ear["due"] or now - state["heard_at"] < 0.2 or state["transcribing"]:
+            continue
+        text, replaces = ear["text"], ear.pop("replaces", None)
+        ear["text"] = ""
+        ear["last"] = {"text": text, "at": now}
+        threading.Thread(target=turn, args=(clean(text) or text, clean(replaces) if replaces else None), daemon=True).start()
+
+
+class FileMic:
+    """Tests: VOICE_MIC_FILE (16 kHz mono wav) stands in for the mic, played in real time once the greeting is
+    over, then silence. Nothing is played out loud."""
+    def __init__(self, path):
+        import wave
+        with wave.open(path) as w:
+            self.pcm = w.readframes(w.getnframes())
+        self.i, self.t = 0, None
+
+    def read(self, n, exception_on_overflow=False):
+        if self.t is None:
+            while not state["acked"] or time.time() < state["play_until"] + 0.5:
+                time.sleep(0.05)
+            self.t = time.time()
+        self.t += n / RATE
+        time.sleep(max(0.0, self.t - time.time()))
+        chunk = self.pcm[self.i:self.i + 2 * n]
+        self.i += 2 * n
+        return chunk.ljust(2 * n, b"\0")
+
+
+class NullSpeaker:
+    def write(self, pcm):
+        time.sleep(len(pcm) / 2 / player["tts"].sample_rate)
+
+
 def listen(vad, asr):
     """Runs until you hang up. Any audio error (headphones unplugged, device switch) reopens the devices."""
+    if os.environ.get("VOICE_MIC_FILE"):
+        player["out"] = NullSpeaker()
+        return hear_loop(vad, asr, FileMic(os.environ["VOICE_MIC_FILE"]))
     import pyaudio
     while state["live"]:
         pa = pyaudio.PyAudio()
@@ -297,8 +385,29 @@ def listen(vad, asr):
             pa.terminate()  # closes mic and speaker too
 
 
+clips = queue.Queue()
+
+
+def transcriber(asr):
+    """Speech to text off the mic loop: a slow transcription must never stop the mic being read, or audio
+    is dropped (pyaudio overflows) and words go missing."""
+    while True:
+        samples = clips.get()
+        try:
+            said = hear(asr, samples)
+            if said and re.search(r"\w", said):
+                heard(said)
+        finally:
+            state["transcribing"] -= 1
+
+
 def hear_loop(vad, asr, mic):
+    threading.Thread(target=transcriber, args=(asr,), daemon=True).start()
+    # The VAD only says when speech starts and stops; the audio is kept here. Its own clips (vad.front) come
+    # back empty or cut short in sherpa-onnx 2.0 ("circular-buffer Invalid n"), which lost whole sentences.
     last = 0.0
+    pre = collections.deque(maxlen=16)  # ~0.5s before the VAD notices speech: the first syllable
+    clip, talking = [], False
     while state["live"]:
         chunk = mic.read(512, exception_on_overflow=False)
         x = np.frombuffer(chunk, np.int16).astype(np.float32) / 32768
@@ -311,20 +420,22 @@ def hear_loop(vad, asr, mic):
             else:
                 x = np.zeros_like(x)  # ponytail: half-duplex gate, not echo cancellation
         vad.accept_waveform(x)
-        if not speaking and vad.is_speech_detected():
+        detected = vad.is_speech_detected()
+        if detected and not speaking:
             state["heard_at"] = time.time()
+        if detected and not talking:
+            talking, clip = True, list(pre)
+        (clip if talking else pre).append(x)
+        while not vad.empty():
+            vad.pop()
+        if talking and (not detected or len(clip) * 512 > 30 * RATE):
+            talking = False
+            state["transcribing"] += 1  # the assembler waits for it
+            clips.put(np.concatenate(clip))
         now = time.time()
         if now - last > 0.1:
             emit(mode="speaking" if speaking else "listening", level=round(state["level"], 3))
             last = now
-        while not vad.empty():
-            seg = vad.front
-            vad.pop()
-            said = hear(asr, seg.samples)
-            if said and re.search(r"\w", said):
-                emit(you=said)
-                interrupt()
-                threading.Thread(target=turn, args=(said,), daemon=True).start()
 
 
 # ---- control port -------------------------------------------------------------------
@@ -345,10 +456,7 @@ def serve():
                 elif self.path == "/note":
                     history.append({"role": "system", "content": body.get("text", "")})
                 elif self.path == "/say" and TEXT:
-                    emit(you=body.get("text", ""))
-                    state["heard_at"] = time.time()
-                    interrupt()
-                    threading.Thread(target=turn, args=(body.get("text", ""),), daemon=True).start()
+                    heard(body.get("text", ""))
                 elif self.path == "/quit":
                     state["live"] = False
                     os.kill(os.getpid(), signal.SIGTERM)
@@ -374,6 +482,7 @@ def project_context():
 
 def main():
     srv = serve()
+    threading.Thread(target=assembler, daemon=True).start()
     try:
         try:
             urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=3).read()
@@ -394,7 +503,7 @@ def main():
         # VOICE_RESUME: the mod restarted a call that dropped, so pick up instead of greeting again
         greeting = "Sorry, I dropped for a second. I'm back." if os.environ.get("VOICE_RESUME") else "Hey. What are we working on?"
         history.append({"role": "assistant", "content": greeting})
-        if TEXT:
+        if TEXT and not os.environ.get("VOICE_MIC_FILE"):
             emit(voice=greeting)
             while state["live"]:
                 time.sleep(0.2)
