@@ -46,4 +46,8 @@ local.ear.update(text="", last={"text": "Run the tests.", "at": local.time.time(
 local.ear.pop("replaces", None)
 local.heard("Also fix the lint.")
 assert local.ear["text"] == "Also fix the lint." and "replaces" not in local.ear
+# "can you see my files?" is answered, not worked on; naming a thing keeps it a request
+assert local.CAPABILITY.match("can you see my files?") and local.CAPABILITY.match("do you have access to my terminal?")
+assert not local.CAPABILITY.match("can you read calc.py?") and not local.CAPABILITY.match("can you run the tests?")
+assert local.spoken("[done] All good.") == "All good."
 print("ok")
