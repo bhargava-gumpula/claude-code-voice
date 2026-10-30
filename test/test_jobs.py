@@ -71,4 +71,12 @@ jobs.work("In the project folder, count the commits on branch main and report th
 assert jobs.work("Count the commits on branch main.").startswith("Already on it")
 assert jobs.work("Count the commits on main, then list the functions in calc.py.").startswith("Not started")
 assert jobs.work("list the functions in calc.py").startswith("Next up") and len(asks) == 2
+# asked again after it finished: the answer it already has, no second run
+asks.clear()
+jobs.finished("x", "")  # flush
+t = threading.Thread(target=lambda: jobs.work("how many files are in the src folder?")); t.start()
+assert until(lambda: len(asks) == 1)
+jobs.finished(asks[0]["id"], "14 files"); t.join()
+r = jobs.work("Count the files in the src folder.")
+assert r.startswith("Already done just now") and "14 files" in r and len(asks) == 1, r
 print("ok")

@@ -12,6 +12,7 @@ class Jobs:
         """emit: the stdout protocol. announce(text): put a [done] message into the conversation.
         idle(): True when nobody is speaking (the voice is not playing and the user is not talking)."""
         self.emit, self.announce, self.idle, self.wait = emit, announce, idle, wait
+        self.recent = []  # finished jobs, for requests repeated after the outcome is in
         self.jobs = {}  # id -> {"task", "result", "done": Event, "told", "progress"}; insertion order = run order
         self.lock = threading.Lock()
         self.ready = threading.Condition(self.lock)
@@ -28,6 +29,9 @@ class Jobs:
             same = next((j for j in self.open() if similar(j["task"], task)), None)
             if same:  # the talker restating a request it already made
                 return f'Already on it ("{same["task"]}"); its outcome comes as a [done] message. Do not ask for it again.'
+            done = next((j for j in reversed(self.recent) if time.time() - j["at"] < 120 and similar(j["task"], task)), None)
+            if done:  # finished a moment ago: the answer is already here
+                return f'Already done just now. Result:\n{done["result"]}\nUse it; do not run it again.'
             part = next((j for j in self.open() if repeats(j["task"], task)), None)
             if part:  # the talker folding an earlier request into a new one: it would run twice
                 return (f'Not started: this repeats "{part["task"]}", which is already being done. '
@@ -44,8 +48,8 @@ class Jobs:
             with self.lock:
                 job["told"] = True
             return f"Done. Result:\n{job['result']}"
-        return ("Still going; it takes longer than a few seconds. Tell the user briefly and keep talking. "
-                "The outcome arrives as a [done] message.")
+        return ("Still going. You already said you're on it, so say nothing more about it now; stay quiet unless "
+                "the user talks. The outcome arrives as a [done] message.")
 
     def progress(self, text, jid=None):
         with self.lock:
@@ -75,6 +79,7 @@ class Jobs:
                                         "done": threading.Event(), "told": False, "progress": ""}
             job["result"] = text
             job["done"].set()
+            self.recent = self.recent[-9:] + [{"task": job["task"], "result": text, "at": time.time()}]
             self.ready.notify()
 
     def _announcer(self):
@@ -102,7 +107,8 @@ class Jobs:
 
 
 def words(text):
-    return {w.strip(".") for w in re.findall(r"[a-z0-9_.]+", text.lower())} - FILLER
+    text = re.sub(r"\bhow many\b", "count", text.lower())
+    return {w.strip(".") for w in re.findall(r"[a-z0-9_.]+", text)} - FILLER
 
 
 def repeats(old, new):
