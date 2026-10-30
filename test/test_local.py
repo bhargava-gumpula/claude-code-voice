@@ -6,7 +6,7 @@ spec = importlib.util.spec_from_file_location("local", os.path.join(os.path.dirn
 local = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local)
 
-assert local.spoken("It has `server.py`, **tests** and [docs](x.md).") == "It has server.py, tests and docs."
+assert local.spoken("It has `server.py`, **tests** and [docs](x.md).") == "It has server dot pie, tests and docs."
 assert local.spoken("   ") == ""
 assert local.work({"instruction": ""}) == "No instruction given."
 assert local.check_progress() == "Nothing is being worked on right now."
@@ -50,4 +50,10 @@ assert local.ear["text"] == "Also fix the lint." and "replaces" not in local.ear
 assert local.CAPABILITY.match("can you see my files?") and local.CAPABILITY.match("do you have access to my terminal?")
 assert not local.CAPABILITY.match("can you read calc.py?") and not local.CAPABILITY.match("can you run the tests?")
 assert local.spoken("[done] All good.") == "All good."
+assert local.spoken("It's in calc.py and README.md.") == "It's in calc dot pie and README dot M D.", local.spoken("It's in calc.py and README.md.")
+# Kokoro drops digits: numbers are spoken as words
+w = local.spoken
+assert w("There are 2 commits.") == "There are two commits.", w("There are 2 commits.")
+assert w("12 passed, 1 failed, 98% done, took 3.5 seconds") == "twelve passed, one failed, ninety-eight percent done, took three point five seconds"
+assert w("1,234 lines") == "one thousand two hundred thirty-four lines", w("1,234 lines")
 print("ok")
