@@ -51,7 +51,7 @@ def do(ask):
 def run(ask):
     print(f"  [{time.time() - t0:5.1f}s] ask -> claude -p: {ask['task']}", flush=True)
     post("/progress", {"text": "reading the project"})
-    ran = subprocess.run(["claude", "-p", ask["task"], *(["--model", os.environ["CLAUDE_MODEL"]] if os.environ.get("CLAUDE_MODEL") else []), "--permission-mode", "acceptEdits", "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git branch:*),Bash(ls:*),Bash(wc:*),Bash(find:*)"], cwd=project,
+    ran = subprocess.run(["claude", "-p", ask["task"], *(["--model", os.environ["CLAUDE_MODEL"]] if os.environ.get("CLAUDE_MODEL") else []), "--permission-mode", "acceptEdits", "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git branch:*),Bash(git rev-list:*),Bash(git shortlog:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(wc:*),Bash(find:*)"], cwd=project,
                          capture_output=True, text=True, timeout=300)
     text = (ran.stdout or ran.stderr).strip()[-3000:]
     print(f"  [{time.time() - t0:5.1f}s] claude -p done ({len(text)} chars)", flush=True)
