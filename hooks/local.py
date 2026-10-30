@@ -42,7 +42,8 @@ each, right away; never resend one already asked. Each outcome arrives as its ow
 request it answers, once. While work runs, stay quiet.
 
 Answer yourself, with no tools: small talk, opinions, general questions, and questions about you ("can you see \
-my files?" -> "Yes, I'm right here in your project.").
+my files?" -> "Yes, I'm right here in your project."). Small talk gets one warm line that hands it back: "hey, \
+how's it going?" -> "Pretty good! What are we working on?"
 
 [done], [progress], [chat] and [context] messages are your own work reporting in, not the user: use them, never \
 read them out. Background in [context] is never mentioned unless asked.
@@ -236,10 +237,42 @@ def history_with_prompt():
 player = {"tts": None, "out": None, "synth": threading.Lock(), "queue": queue.Queue()}
 
 
+ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen " \
+       "seventeen eighteen nineteen".split()
+TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def number(n):
+    """Integer to words: Kokoro skips digits entirely ("2 commits" was spoken as "commits")."""
+    if n < 20:
+        return ONES[n]
+    if n < 100:
+        return TENS[n // 10] + ("-" + ONES[n % 10] if n % 10 else "")
+    for size, name in ((10**9, "billion"), (10**6, "million"), (1000, "thousand"), (100, "hundred")):
+        if n >= size:
+            rest = n % size
+            return number(n // size) + " " + name + (" " + number(rest) if rest else "")
+
+
+def words_for_numbers(text):
+    text = re.sub(r"(\d),(\d{3})", r"\1\2", text)  # 1,200 -> 1200
+    text = re.sub(r"(\d+)%", r"\1 percent", text)
+    text = re.sub(r"\b(\d+)\.(\d+)\b", lambda m: number(int(m.group(1))) + " point " + " ".join(ONES[int(d)] for d in m.group(2)), text)
+    return re.sub(r"\b\d{1,12}\b", lambda m: number(int(m.group(0))), text)
+
+
+SAY_EXT = {"py": "pie", "js": "J S", "ts": "T S", "tsx": "T S X", "jsx": "J S X", "md": "M D", "json": "jason",
+           "yml": "yaml", "sh": "S H", "txt": "text", "css": "C S S", "html": "H T M L"}
+
+
 def spoken(text):
     """Markdown and code marks read badly aloud: drop them."""
     text = re.sub(r"\[(?:done|progress|chat|context)\]\s*", "", text, flags=re.I)  # tags it copies from its inputs
     text = re.sub(r"[`*_#>]+", "", text)
+    text = words_for_numbers(text)
+    # file endings the way people say them; Kokoro mangles "calc.py"
+    text = re.sub(r"\.(py|js|ts|tsx|jsx|md|json|yml|yaml|sh|toml|txt|css|html)\b",
+                  lambda m: " dot " + SAY_EXT.get(m.group(1).lower(), m.group(1)), text, flags=re.I)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
 
