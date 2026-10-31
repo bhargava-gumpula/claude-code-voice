@@ -66,6 +66,9 @@ def reader():
             continue
         if "port" in msg:
             port[0] = msg["port"]
+            if os.environ.get("VOICE_RECAP"):  # what the mod sends at call start: a recap of the chat so far
+                threading.Thread(target=post, args=("/note", {"text": "[context] Earlier in this chat, before the call "
+                                 "(background: use it, don't recite it): " + os.environ["VOICE_RECAP"]}), daemon=True).start()
         elif "agent_id" in msg:
             open(store, "w").write(msg["agent_id"])
         elif "voice" in msg:
