@@ -17,7 +17,7 @@ Control, HTTP on 127.0.0.1:<port>, JSON bodies:
 Env: ELEVENLABS_API_KEY (required), ELEVENLABS_AGENT_ID (else one is created), ELEVENLABS_VOICE_ID,
      VOICE_PROJECT (the project folder), VOICE_LLM, VOICE_TEXT=1 (no audio: a text session for tests).
 """
-import array, json, math, os, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
+import array, collections, json, math, os, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from elevenlabs.client import ElevenLabs
@@ -35,10 +35,12 @@ PROJECT = os.environ.get("VOICE_PROJECT", os.getcwd())
 TEXT = os.environ.get("VOICE_TEXT") == "1"
 API = "https://api.elevenlabs.io/v1"
 WAIT = float(os.environ.get("VOICE_WAIT", "9"))  # how long `work` holds for a quick answer before "still on it"
-# Interruptions: while the agent's audio plays, mic audio only gets through above BARGE_LEVEL, so its own
-# voice from the speakers (quiet at the mic) is dropped but you speaking up (loud at the mic) cuts it off.
-# Calibration knob: 0.3 suits a laptop at normal volume; raise it if it interrupts itself, 1.01 = never.
-BARGE_LEVEL = float(os.environ.get("BARGE_LEVEL", "0.3"))
+# Interruptions: while the agent's audio plays, the mic also hears it from the speakers. EchoGate learns how
+# loud that echo is relative to what is playing, and lets mic audio through only when it is clearly louder
+# than the echo would be: you talking. Knobs: BARGE_LEVEL is the floor (raise it if it interrupts itself,
+# 1.01 = never), BARGE_MARGIN how much louder than the echo you must be.
+BARGE_LEVEL = float(os.environ.get("BARGE_LEVEL", "0.06"))
+BARGE_MARGIN = float(os.environ.get("BARGE_MARGIN", "2.5"))
 SAMPLE_RATE = 16000
 
 PROMPT = """You are Claude Code, talking with your user out loud. This voice is you: the same Claude Code that \
@@ -96,7 +98,7 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {}}},
 ]
 
-state = {"level": 0.0, "play_until": 0.0, "live": True, "conv": None, "heard_at": 0.0}
+state = {"started": False, "notes": [], "level": 0.0, "out_level": 0.0, "play_until": 0.0, "live": True, "conv": None, "heard_at": 0.0}
 out_lock = threading.Lock()
 
 
@@ -173,20 +175,45 @@ jobs = Jobs(emit, announce, idle, WAIT)
 
 # ---- audio ----------------------------------------------------------------------------
 
+def rms(pcm):
+    samples = array.array("h", pcm)
+    return min(1.0, math.sqrt(sum(s * s for s in samples) / len(samples)) / 8000) if samples else 0.0
+
+
+class EchoGate:
+    """While the voice plays: is this mic chunk the user talking, or just the voice's own echo?
+    ponytail: a loudness gate, not echo cancellation; it learns echo/playback ratio as the call goes."""
+    def __init__(self):
+        self.ratios = collections.deque(maxlen=60)  # mic/playback level while playing, last ~15s of it
+
+    def echo(self):
+        if len(self.ratios) < 8:
+            return 0.2  # a laptop at normal volume, until it has heard enough
+        return sorted(self.ratios)[len(self.ratios) // 4]  # low quartile: echo, not the user talking over it
+
+    def passes(self, level, out_level):
+        threshold = max(BARGE_LEVEL, BARGE_MARGIN * self.echo() * out_level)
+        if out_level > 0.02:
+            self.ratios.append(level / out_level)
+        return level > threshold
+
+
 class Audio(DefaultAudioInterface):
     def start(self, input_callback):
+        gate = EchoGate()
+
         def on_mic(chunk):
-            samples = array.array("h", chunk)
-            if samples:
-                state["level"] = min(1.0, math.sqrt(sum(s * s for s in samples) / len(samples)) / 8000)
-                if state["level"] > 0.15 and time.time() > state["play_until"] + 0.4:
-                    state["heard_at"] = time.time()
-            if time.time() < state["play_until"] + 0.4 and state["level"] < BARGE_LEVEL:
-                chunk = bytes(len(chunk))  # ponytail: half-duplex gate, not echo cancellation
+            state["level"] = level = rms(chunk)
+            if time.time() < state["play_until"] + 0.3:
+                if not gate.passes(level, state["out_level"]):
+                    chunk = bytes(len(chunk))  # its own voice: ElevenLabs must not hear it as the user
+            elif level > 0.15:
+                state["heard_at"] = time.time()
             input_callback(chunk)
         super().start(on_mic)
 
     def output(self, audio):
+        state["out_level"] = max(rms(audio), state["out_level"] * 0.6)  # loudness of what is playing about now
         start = max(time.time(), state["play_until"])
         state["play_until"] = start + len(audio) / 2 / SAMPLE_RATE
         super().output(audio)
@@ -265,8 +292,11 @@ def serve():
                     jobs.progress(body.get("text", ""), body.get("id"))
                     if conv:
                         conv.send_contextual_update(f"[progress] {body.get('text', '')}")
-                elif self.path == "/note" and conv:
-                    conv.send_contextual_update(body.get("text", ""))
+                elif self.path == "/note":
+                    if conv and state["started"]:
+                        conv.send_contextual_update(body.get("text", ""))
+                    else:  # before the session is up (the chat recap often is): sent once it starts
+                        state["notes"].append(body.get("text", ""))
                 elif self.path == "/say" and conv and TEXT:
                     emit(you=body.get("text", ""))
                     state["heard_at"] = time.time()
@@ -317,6 +347,9 @@ def main():
         conv.start_session()
         time.sleep(0.5)
         conv.send_contextual_update(project_context())
+        state["started"] = True
+        while state["notes"]:
+            conv.send_contextual_update(state["notes"].pop(0))
         conv.wait_for_session_end()
     except Exception as e:  # noqa: BLE001
         emit(error=str(e)); return 1
