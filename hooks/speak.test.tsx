@@ -23,11 +23,15 @@ test("the agent's ask reaches the chat and Claude's answer reaches the agent", a
     return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
   })
   on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { isAnswered: true, text: 'We have been building a voice add-on.' } }) as never)
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.command.run({ command: 'call', args: '' })
   for (let i = 0; i < 200 && !submitted.length; i++) await new Promise(r => setTimeout(r, 25))
   expect(submitted).toContain('run the tests')
+
+  // the voice is told what the chat has been about
+  expect(posted.some(p => p.includes('/note') && p.includes('building a voice add-on'))).toBe(true)
 
   await $.turn.complete({ reason: 'answer', answer: 'All green.' } as never)
   expect(posted.some(p => p.includes('127.0.0.1:4242/result') && p.includes('"a1"') && p.includes('All green.'))).toBe(true)

@@ -15,6 +15,7 @@ const SPOKEN =
 // ponytail: one call per session; a second /voice hangs up
 let port = 0
 let ending = false
+let recap: Promise<string> = Promise.resolve('')
 let quickFails = 0 // restarts that died again within 20s; three in a row and we stop
 // Claude's turns in the order they will run: an ask's id, or '' for a prompt typed in the chat.
 // Prompts submitted while Claude is busy wait their turn, so turn.complete answers the head.
@@ -71,6 +72,10 @@ const hangUp = async ($: EngineInterface) => {
   await update($, call, () => OFF)
 }
 
+const RECAP = 'A voice call with the user is starting, and the voice taking it needs to know where this chat stands. ' +
+  'In under 150 words of plain prose (no lists, no markdown), say what the user and you have been working on, ' +
+  'decisions made, what was just done, and anything still open. If nothing has happened yet, reply with nothing.'
+
 type Backend = 'local' | 'elevenlabs'
 
 // Which voice stack: what /call was told, else what was used last, else ElevenLabs when a key is set.
@@ -113,6 +118,10 @@ const start = async ($: EngineInterface, asked = '', resume = false) => {
   if (resume) env.VOICE_RESUME = '1'
   if (ending) return // hung up while Python was being set up
   const startedAt = Date.now()
+  // What this chat has been about, so the voice joins the conversation instead of starting cold. A fork
+  // over the session's own transcript (cached prefix); nothing when the chat is new.
+  if (!resume) recap = $.model.fork({ prompt: RECAP }).then(r => (r.isAnswered ? r.text.trim() : ''), () => '')
+  const told = recap // a reconnect hands the same recap to the restarted voice
 
   void (async () => {
     const ear = $.process.spawn({ argv: [py, '-I', `${$.plugin.root}/hooks/${backend === 'local' ? 'local.py' : 'agent.py'}`], env })
@@ -146,6 +155,7 @@ const start = async ($: EngineInterface, asked = '', resume = false) => {
           if (msg.port) {
             port = msg.port
             await patch($, { mode: 'listening', note: '' })
+            void told.then(async text => { if (text && port) await post($, '/note', { text: `[context] Earlier in this chat, before the call (background: use it, don't recite it): ${text.slice(0, 2500)}` }) })
           } else if (msg.agent_id) {
             await $.store.set('agentId', msg.agent_id)
           } else if (msg.you) {
